@@ -1,12 +1,19 @@
 from pathlib import Path
 import argparse
+import os
+from functools import lru_cache
 
 import datasets
+import torch
 from thefuzz import fuzz
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    logging,
+)
 
 from news import DPR
-from transformers import logging
-from utils import get_gpt_response, get_gemini_response
+from utils import get_gpt_response
 from search import get_google_ctx
 
 logging.set_verbosity_error() 
@@ -15,41 +22,68 @@ logging.set_verbosity_error()
 DATASET_PATH = "local/hf_datasets/"
 GPT4 = "gpt-4o-2024-05-13"
 REWRITE_THRESHOLD = 60
-
-def get_chat_preds(messages, model, cot, stop=None):
-    try:
-        if model.startswith("gpt"):
-            res = get_gpt_response(messages, model, 1.0, 3 if cot else 100, 1000 if cot else 10)
-            preds = [choice.message.content.splitlines()[-1] for choice in res.choices]
-        elif model.startswith("gemini"):
-            res = get_gemini_response(messages, model, 1.0, 1, 1000 if cot else 10, stop)
-            preds = [res.splitlines()[-1]]
-        elif model.startswith("meta"):
-            res = get_gpt_response(messages, model, 1.0, 3 if cot else 6, 1000 if cot else 10, stop=["<|eot_id|>","<|eom_id|>"])
-            preds = [choice.message.content.splitlines()[-1] for choice in res.choices]
-    except Exception as e:
-        print(e)
-        preds = []
-    return preds
+DEFAULT_ENCODER_MODEL = os.environ.get(
+    "ENCODER_DISCRIMINATOR_MODEL", "microsoft/deberta-v3-base-mnli"
+)
+MAX_ENCODER_SEQ_LEN = int(os.environ.get("ENCODER_DISCRIMINATOR_MAX_LEN", "512"))
 
 
-def process_numerical_preds(predictions):
-    # filter out non-numeric predictions
-    predictions = [
-        p.replace(".", "") for p in predictions if p.replace(".", "").isdigit()
-    ]
-    # keep only 1-10
-    predictions = [int(p) for p in predictions if 1 <= int(p) <= 10]
+class EncoderDiscriminator:
+    """
+    Lightweight encoder-based discriminator that predicts the plausibility
+    of a news story using a sequence classification model.
+    """
 
-    if len(predictions) == 0:
-        print("No valid predictions")
-        return 0, [], 0, 0
-    
-    majority = max(set(predictions), key=predictions.count)
-    
-    score = sum(predictions) / len(predictions)
-    variance = sum([(p - score) ** 2 for p in predictions]) / len(predictions)
-    return score, predictions, variance, majority
+    def __init__(
+        self,
+        model_name: str = DEFAULT_ENCODER_MODEL,
+        max_length: int = MAX_ENCODER_SEQ_LEN,
+    ):
+        self.model_name = model_name
+        self.max_length = max_length
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, trust_remote_code=True
+        ).to(self.device)
+        self.model.eval()
+        self.positive_label_id = self._detect_positive_label_id()
+
+    def _detect_positive_label_id(self) -> int:
+        """
+        Try to infer which label corresponds to 'real/entail/true' so that the
+        discriminator can output a plausibility probability.
+        """
+        id2label = {
+            int(k): v for k, v in self.model.config.id2label.items()
+        }
+        for idx, label in id2label.items():
+            label_lower = label.lower()
+            if any(
+                key in label_lower
+                for key in ("true", "real", "entail", "support", "pos", "positive")
+            ):
+                return int(idx)
+        # default to label 1 if present, otherwise 0
+        return 1 if 1 in id2label else 0
+
+    @torch.no_grad()
+    def predict_prob(self, text: str) -> float:
+        inputs = self.tokenizer(
+            text,
+            truncation=True,
+            padding=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        ).to(self.device)
+        logits = self.model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)
+        return probs[0, self.positive_label_id].item()
+
+
+@lru_cache(maxsize=1)
+def get_encoder_discriminator(model_name: str = DEFAULT_ENCODER_MODEL) -> EncoderDiscriminator:
+    return EncoderDiscriminator(model_name=model_name)
 
 
 def get_retrieval_ctx(example, prefix, source="dpr"):
@@ -71,60 +105,43 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
     return text
 
 
-def get_score(example, rag, prefix="", rationale=False, model=GPT4):
+def get_score(example, rag, prefix="", rationale=False, model=None):
     """
-    Score the plausicility of a news story.
+    Score the plausibility of a news story using an encoder-based discriminator.
 
     Args:
         example: The example to get the score for.
         rag: Whether to use RAG context.
         prefix: Empty string or "f_" for fake news.
         rationale: Whether to ask for rationale (Chain of Thought).
-        model: The model to use.
+        model: Deprecated; kept for API compatibility.
     Returns:
-        The mean, the variance, and the raw predictions of all candidate scores.
+        A dict with the plausibility score (1-10), raw predictions list,
+        variance (0 for deterministic encoder), and a majority flag.
     """
 
     text = get_retrieval_ctx(example, prefix) if rag else ""
-    text += "Please predict the plausibility of the following news story:\n\n"
+    text += "Predict the plausibility of the following news story:\n\n"
     text += f'{example["date_publish"].date()} - {example[prefix + "title"]}\n{example[prefix + "description"]}\n\n'
 
-    predictions = get_chat_preds(
-        messages=[
-            {
-                "role": "system",
-                "content": "Today is March 26, 2024. You predict the plausibility of a news you haven't seen" + (", given a list of related news stories from search results." if rag else "."),
-            },
-            (
-                {
-                    "role": "user",
-                    "content": text
-                    + "\n\nPlease give a number representing the plausibility (1-10) and nothing else.",
-                }
-                if not rationale
-                else {
-                    "role": "user",
-                    "content": text
-                    + "\n\nPlease first give me your reasoning, and start a new line to give a number representing the plausibility (1-10) and nothing else.",
-                }
-            ),
-        ],
-        model=model,
-        cot=rationale,
-    )
+    discriminator = get_encoder_discriminator()
+    prob_true = discriminator.predict_prob(text)
 
-    score, predictions, variance, majority = process_numerical_preds(predictions)
-
-    suffix = ""
+    # map probability (0-1) to prior 1-10 scale for downstream compatibility
+    score = prob_true * 9 + 1
+    predictions = [round(score, 4)]
+    variance = 0.0
+    majority = 1 if prob_true >= 0.5 else 0
 
     if rag:
         prefix += "rag_"
 
     return {
-        prefix + "score" + suffix: score,
-        prefix + "preds" + suffix: predictions,
-        prefix + "var" + suffix: variance,
-        prefix + "majority" + suffix: majority,
+        prefix + "score": score,
+        prefix + "preds": predictions,
+        prefix + "var": variance,
+        prefix + "majority": majority,
+        prefix + "prob_true": prob_true,
     }
 
 
