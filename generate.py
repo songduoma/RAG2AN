@@ -23,7 +23,7 @@ DATASET_PATH = "local/hf_datasets/"
 GPT4 = "gpt-4o-2024-05-13"
 REWRITE_THRESHOLD = 60
 DEFAULT_ENCODER_MODEL = os.environ.get(
-    "ENCODER_DISCRIMINATOR_MODEL", "microsoft/deberta-v3-base-mnli"
+    "ENCODER_DISCRIMINATOR_MODEL", "microsoft/deberta-v3-base"
 )
 MAX_ENCODER_SEQ_LEN = int(os.environ.get("ENCODER_DISCRIMINATOR_MAX_LEN", "512"))
 
@@ -32,6 +32,7 @@ class EncoderDiscriminator:
     """
     Lightweight encoder-based discriminator that predicts the plausibility
     of a news story using a sequence classification model.
+    Includes functionality to identify suspicious words via Attention mechanisms.
     """
 
     def __init__(
@@ -43,17 +44,18 @@ class EncoderDiscriminator:
         self.max_length = max_length
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        
+        # 加入 output_attentions=True
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, trust_remote_code=True
+            model_name, 
+            trust_remote_code=True,
+            output_attentions=True 
         ).to(self.device)
+        
         self.model.eval()
         self.positive_label_id = self._detect_positive_label_id()
 
     def _detect_positive_label_id(self) -> int:
-        """
-        Try to infer which label corresponds to 'real/entail/true' so that the
-        discriminator can output a plausibility probability.
-        """
         id2label = {
             int(k): v for k, v in self.model.config.id2label.items()
         }
@@ -64,7 +66,6 @@ class EncoderDiscriminator:
                 for key in ("true", "real", "entail", "support", "pos", "positive")
             ):
                 return int(idx)
-        # default to label 1 if present, otherwise 0
         return 1 if 1 in id2label else 0
 
     @torch.no_grad()
@@ -79,6 +80,46 @@ class EncoderDiscriminator:
         logits = self.model(**inputs).logits
         probs = torch.softmax(logits, dim=-1)
         return probs[0, self.positive_label_id].item()
+
+    # 新增這個函式，用來抓出權重最高的字 (Generator 需要)
+    @torch.no_grad()
+    def get_suspicious_words(self, text: str, top_k: int = 5) -> str:
+        inputs = self.tokenizer(
+            text,
+            truncation=True,
+            padding=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        ).to(self.device)
+        
+        outputs = self.model(**inputs)
+        
+        # 1. 抓取最後一層 Attention
+        attentions = outputs.attentions[-1].cpu()
+        # 2. 平均所有 Head
+        avg_att = torch.mean(attentions, dim=1).squeeze(0)
+        # 3. 取出 [CLS] 對其他 token 的關注度
+        cls_att = avg_att[0, :]
+        
+        # 4. 處理 Token (過濾特殊符號)
+        input_ids = inputs['input_ids'][0].cpu().numpy()
+        special_mask = [
+            x in [self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.pad_token_id] 
+            for x in input_ids
+        ]
+        # 將特殊 token 分數歸零，避免選中
+        cls_att[special_mask] = 0
+        
+        # 5. 找出分數最高的 Top-K
+        values, indices = torch.topk(cls_att, k=min(top_k, len(cls_att)))
+        
+        suspicious_list = []
+        for idx, val in zip(indices, values):
+            # 解碼回文字
+            word = self.tokenizer.decode([input_ids[idx]])
+            suspicious_list.append(f"{word}({val:.2f})")
+            
+        return ", ".join(suspicious_list)
 
 
 @lru_cache(maxsize=1)
@@ -107,17 +148,7 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
 
 def get_score(example, rag, prefix="", rationale=False, model=None):
     """
-    Score the plausibility of a news story using an encoder-based discriminator.
-
-    Args:
-        example: The example to get the score for.
-        rag: Whether to use RAG context.
-        prefix: Empty string or "f_" for fake news.
-        rationale: Whether to ask for rationale (Chain of Thought).
-        model: Deprecated; kept for API compatibility.
-    Returns:
-        A dict with the plausibility score (1-10), raw predictions list,
-        variance (0 for deterministic encoder), and a majority flag.
+    Score the plausibility and identify suspicious words using Attention.
     """
 
     text = get_retrieval_ctx(example, prefix) if rag else ""
@@ -126,6 +157,9 @@ def get_score(example, rag, prefix="", rationale=False, model=None):
 
     discriminator = get_encoder_discriminator()
     prob_true = discriminator.predict_prob(text)
+    
+    # 在這裡呼叫抓字功能
+    suspicious_words = discriminator.get_suspicious_words(text, top_k=5)
 
     # map probability (0-1) to prior 1-10 scale for downstream compatibility
     score = prob_true * 9 + 1
@@ -142,241 +176,10 @@ def get_score(example, rag, prefix="", rationale=False, model=None):
         prefix + "var": variance,
         prefix + "majority": majority,
         prefix + "prob_true": prob_true,
+        # 把結果存進 Dataset 裡，使得 Generator 讀得到
+        prefix + "suspicious_words": suspicious_words 
     }
 
-
-def get_rationale(example, rag, prefix=""):
-
-    text = get_retrieval_ctx(example, prefix) if rag else ""
-    text += "Please predict the plausibility of the following news story:\n\n"
-    text += f'{example["date_publish"].date()} - {example[prefix + "title"]}\n{example[prefix + "description"]}\n\n'
-
-    res = get_gpt_response(
-        messages=[
-            {
-                "role": "system",
-                "content": "Today is March 26, 2024. You fact-check a news you haven't seen, given a list of related news stories from search results.",
-            },
-            {
-                "role": "user",
-                "content": text
-                + "\n\nPlease explain what you find suspicious about the news story. Give the top 3 points in a list format and nothing else.",
-            },
-        ],
-        model=GPT4,
-        temperature=0,
-    )
-
-    rationale = res.choices[0].message.content.strip()
-
-    return {
-        prefix + ("rag_" if rag else "") + "rationale": rationale,
-    }
-
-
-def confirm_fake(title, description, f_title, f_description):
-
-    title_similarity = fuzz.ratio(f_title, title)
-    description_similarity = fuzz.ratio(f_description, description)
-    if (
-        title_similarity <= REWRITE_THRESHOLD
-        or description_similarity <= REWRITE_THRESHOLD
-    ):
-        return False, [
-            "Fail to satisfy rewrite similarity threshold",
-            title_similarity,
-            description_similarity,
-        ]
-
-    text = f"News 1\nTitle: {title}\nDescription: {description}\n\nNews 2\nTitle: {f_title}\nDescription: {f_description}"
-
-    res = get_gpt_response(
-        messages=[
-            {
-                "role": "user",
-                "content": text
-                + "\n\nDoes News 2 conflict with News 1? Please type yes or no and nothing else.",
-            },
-        ],
-        model=GPT4,
-        temperature=0.0,
-        n=10,
-    )
-
-    raw_output = [c.message.content.lower() for c in res.choices]
-    ratio = sum(["yes" in c.message.content.lower() for c in res.choices]) / len(
-        res.choices
-    )
-
-    return ratio >= 0.8, raw_output
-
-
-def adv_rewrite(example, rag=False):
-
-    text = "Please rewrite the following news story.\n\n"
-    # date - title - description
-    text += f'News Date: {example["date_publish"].date()}\nTitle: {example["title"]}\nDescription: {example["description"]}\n\n'
-    text += f'It was previously rewrote as:\nTitle: {example["f_title"]}\nDescription: {example["f_description"]}\n\n'
-    rationale = example["f_rag_rationale"] if rag else example["f_rationale"]
-    text += f'Fact-checkers found the following suspicious:\n{rationale}\n\n'
-    text += f"Please rewrite the news story to make it more believable and fool the fact-checkers."
-
-    date_instructions = "Today is March 26, 2024."
-    open_instructions = " Please rewrite a real recent news story to introduce some believable factual errors. The modification should be able to fool professional fact-checkers."
-    format_instructions = "\n\nFormat\nError introduced:\nTitle:\nDescription:"
-
-    instructions = date_instructions + open_instructions + format_instructions
-
-    samples = []
-    error_message = ["Failed to rewrite:", text]
-
-    for _ in range(5):
-        res = get_gpt_response(
-            messages=[
-                {
-                    "role": "system",
-                    "content": instructions,
-                },
-                {"role": "user", "content": text},
-            ],
-            model=GPT4,
-            temperature=1.0,
-            n=8,
-            stop=["Fact-checkers"],
-            max_tokens=300,
-        )
-
-        for i in range(len(res.choices)):
-            content = res.choices[i].message.content
-            error_message.append(content)
-            # try parse the title and description, otherwise return empty strings
-            try:
-                content = content.replace(":\n", ": ")
-                items = content.strip().split("\n")
-                items = [
-                    item for item in items if item and not item.startswith("News Date:")
-                ]
-                error, title, description = items[:3]
-                title = title[7:] if title.startswith("Title: ") else title
-                description = (
-                    description[13:]
-                    if description.startswith("Description: ")
-                    else description
-                )
-                error = error[18:] if error.startswith("Error introduced: ") else error
-
-                success, raw_output = confirm_fake(
-                    example["title"], example["description"], title, description
-                )
-                if success:
-                    samples.append(
-                        (
-                            get_score(example, True, "f_", rationale=False)[
-                                "f_rag_score"
-                            ],
-                            {
-                                "f_title": title,
-                                "f_description": description,
-                                "f_error": error,
-                            },
-                        )
-                    )
-                else:
-                    error_message.append(str(raw_output))
-            except Exception as e:
-                error_message.append(str(e))
-                continue
-
-        if len(samples) > 0:
-            break
-
-    if len(samples) == 0:
-        return {
-            "f_title": "",
-            "f_description": "",
-            "f_error": "",
-        }
-    else:
-        # return the one with the highest score
-        return max(samples, key=lambda x: x[0])[1]
-
-
-def rewrite(example, rag=False, type="entity"):
-
-    text = (
-        (
-            get_retrieval_ctx(example, prefix="f_")
-            + f"Please rewrite the following news story.\n\n"
-        )
-        if rag
-        else ""
-    )
-    # date - title - description
-    text += f'News Date: {example["date_publish"].date()}\nTitle: {example["title"]}\nDescription: {example["description"]}'
-
-    date_instructions = "Today is March 26, 2024."
-    subs_instructions = " You will be given a recent news story, please rewrite it by substituting one or two entities (names or locations) to their equivalence, but the news should still looks true."
-    open_instructions = " Please rewrite a real recent news story to introduce some believable factual errors. The modification should be able to fool professional fact-checkers."
-    rag_instructions = (
-        " You should also consider a list of related news stories from search results that people might use to fact-check the news story you write."
-        if rag
-        else ""
-    )
-    format_instructions = "\n\nFormat\nError introduced:\nTitle:\nDescription:"
-
-    instructions = (
-        date_instructions
-        + (subs_instructions if type == "entity" else open_instructions)
-        + rag_instructions
-        + format_instructions
-    )
-
-    for _ in range(5):
-        res = get_gpt_response(
-            messages=[
-                {
-                    "role": "system",
-                    "content": instructions,
-                },
-                {"role": "user", "content": text},
-            ],
-            model=GPT4,
-            temperature=1.0,
-            n=5,
-        )
-
-        for i in range(len(res.choices)):
-            content = res.choices[i].message.content
-            # try parse the title and description, otherwise return empty strings
-            try:
-                content = content.replace(":\n", ": ")
-                items = content.strip().split("\n")
-                items = [item for item in items if item]
-                error, title, description = items
-                title = title[7:] if title.startswith("Title: ") else title
-                description = (
-                    description[13:]
-                    if description.startswith("Description: ")
-                    else description
-                )
-                error = error[18:] if error.startswith("Error introduced: ") else error
-                if confirm_fake(
-                    example["title"], example["description"], title, description
-                ):
-                    return {
-                        "f_title": title,
-                        "f_description": description,
-                        "f_error": error,
-                    }
-            except:
-                continue
-
-    print("Failed to rewrite")
-    return {
-        "f_title": "",
-        "f_description": "",
-        "f_error": "",
-    }
 
 
 def get_dpr_results(example, dpr, search_key="title", prefix=""):
@@ -401,115 +204,23 @@ def get_dpr_results(example, dpr, search_key="title", prefix=""):
 
 def get_new_dataset(ds, args):
     if args.preflight:
-        # get the first n examples
-        n = 10
-        ds = ds.select(range(n))
-        print("Preflight check with {n} examples".format(n=n))
+        ds = ds.select(range(10))
 
     print("=" * 80)
     print("Initiating RAG")
     dpr = DPR()
     print("=" * 80)
 
-    if args.first_round:
-        # get score for positive examples
-        ds = ds.map(lambda example: get_score(example, rag=False), num_proc=args.num_proc)
-        print("Scored positive examples")
+    # score positives
+    ds = ds.map(lambda example: get_score(example, rag=False), num_proc=args.num_proc)
 
-        # get DPR results for positive examples, num_proc=1 is important
-        ds = ds.map(lambda example: get_dpr_results(example, dpr), num_proc=1)
+    # DPR retrieve
+    ds = ds.map(lambda example: get_dpr_results(example, dpr), num_proc=1)
 
-        # get rag score for positive examples
-        ds = ds.map(
-            lambda example: get_score(example, rag=True, rationale=False),
-            num_proc=args.num_proc,
-        )
-        print("Scored positive examples w/ RAG")
+    # RAG score positives
+    ds = ds.map(lambda example: get_score(example, rag=True), num_proc=args.num_proc)
 
-    shift = 1
-    for round_num in range(shift, args.num_rounds + shift):
-
-        print(f"Round {round_num}")
-
-        if args.generation_context_type == "none":
-            # generate negative examples (fake news)
-            ds = ds.map(
-                lambda example: rewrite(
-                    example, rag=False, type=args.substitution_type
-                ),
-                num_proc=args.num_proc,
-            )
-            print("Generated negative examples")
-
-        elif args.generation_context_type == "rag_raw":
-            # generate negative examples (fake news) w/ DPR
-            ds = ds.map(
-                lambda example: rewrite(example, rag=True, type=args.substitution_type),
-                num_proc=args.num_proc,
-            )
-            print("Generated negative examples w/ retrieval context")
-
-        elif args.generation_context_type == "rag_rationale":
-            ds = ds.map(
-                lambda example: adv_rewrite(
-                    example, rag=True
-                ),
-                num_proc=args.num_proc,
-            )
-            print("Generated negative examples w/ detector rationale (RAG)")
-
-        elif args.generation_context_type == "rationale":
-            ds = ds.map(
-                lambda example: adv_rewrite(
-                    example, rag=False
-                ),
-                num_proc=args.num_proc,
-            )
-            print("Generated negative examples w/ detector rationale")
-
-        # filter out examples that are not rewritten, i.e., empty f_title or f_description
-        size_before_filter = ds.num_rows
-        ds = ds.filter(
-            lambda example: len(example["f_title"]) > 0
-            and len(example["f_description"]) > 0
-        )
-        print(
-            f"Filtered out {size_before_filter - ds.num_rows} examples that could not be rewritten."
-        )
-
-        # get score for negative examples
-        ds = ds.map(
-            lambda example: get_score(example, rag=False, prefix="f_"), num_proc=args.num_proc
-        )
-        print("Scored negative examples")
-
-        # get DPR results for negative examples
-        ds = ds.map(
-            lambda example: get_dpr_results(example, dpr, prefix="f_"), num_proc=1
-        )
-
-        # get rag score for negative examples
-        ds = ds.map(
-            lambda example: get_score(example, rag=True, prefix="f_", rationale=False),
-            num_proc=args.num_proc,
-        )
-        print("Scored negative examples w/ RAG")
-
-        # get post-hoc rationale (w/o RAG) for negative examples
-        ds = ds.map(
-            lambda example: get_rationale(example, False, "f_"), num_proc=args.num_proc
-        )
-        # get post-hoc rationale (w/ RAG) for negative examples
-        ds = ds.map(
-            lambda example: get_rationale(example, True, "f_"), num_proc=args.num_proc
-        )
-
-        print(f"Round {round_num} completed")
-        print(f'ROC AUC: {get_roc_auc(ds["score"], ds["f_score"])}')
-        print(f'ROC AUC (RAG): {get_roc_auc(ds["rag_score"], ds["f_rag_score"])}')
-
-        # save the dataset to disk
-        ds.save_to_disk(str(args.path) + f"_round{round_num}")
+    ds.save_to_disk(str(args.path))
     return ds
 
 
@@ -559,24 +270,6 @@ if __name__ == "__main__":
         "--first-round",
         action="store_true",
         help="Whether to run the first round of the game. Only in the first round, we score the positives.",
-    )
-    parser.add_argument(
-        "--substitution-type",
-        type=str,
-        default="open",
-        help="The type of generation: entity, open",
-    )
-    parser.add_argument(
-        "--generation-context-type",
-        type=str,
-        default="none",
-        help="The type of context: none, rag_raw, rag_rationale",
-    )
-    parser.add_argument(
-        "--num-rounds",
-        type=int,
-        default=1,
-        help="The number of rounds to run the game.",
     )
     parser.add_argument(
         "--num-proc", type=int, default=10, help="The number of processors to use."
