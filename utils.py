@@ -1,8 +1,14 @@
 import os
-import openai
-import google.generativeai as genai
 import time
 from functools import wraps
+
+import openai
+
+# Gemini is optional; import lazily to avoid hard dependency on GEMINI_API_KEY.
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None
 
 def retry_with_backoff(retries=3, backoff_factor=2):
     """Decorator for retrying a function with exponential backoff"""
@@ -21,9 +27,11 @@ def retry_with_backoff(retries=3, backoff_factor=2):
                     time.sleep(wait_time)
             return func(*args, **kwargs)
         return wrapper
-    return decorator 
+    return decorator
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# Configure Gemini only if available and key is set; otherwise keep it disabled.
+if genai is not None and os.environ.get("GEMINI_API_KEY"):
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 
 @retry_with_backoff(retries=10)
@@ -49,6 +57,11 @@ GEMINI_SAFETY_SETTINGS_BLOCK_NONE = {
 
 @retry_with_backoff(retries=10)
 def get_gemini_response(messages, model, temperature, n=1, max_tokens=500, stop=None):
+    if genai is None:
+        raise RuntimeError("google-generativeai not available; install and set GEMINI_API_KEY to use Gemini.")
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not set; please export it to use Gemini.")
+
     # Extract the system instruction and messages history
     system_instruction = None
     history = []

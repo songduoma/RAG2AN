@@ -1,7 +1,13 @@
-from serpapi import GoogleSearch
 import os
 
 def search_serpapi(q):
+    try:
+        from serpapi import GoogleSearch  # lazy import to avoid hard dependency when google RAG is unused
+    except Exception as exc:
+        raise ImportError(
+            "serpapi is required for Google RAG. Install `google-search-results` or set RAG_SOURCE to wiki/none."
+        ) from exc
+
     params = {
         "api_key": os.environ["SERPAPI_API_KEY"],
         "engine": "google",

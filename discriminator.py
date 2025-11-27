@@ -1,26 +1,19 @@
-from pathlib import Path
-import argparse
 import os
 from functools import lru_cache
 
-import datasets
 import torch
-from thefuzz import fuzz
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     logging,
 )
 
-from news import DPR
-from utils import get_gpt_response
 from search import get_google_ctx
 
 logging.set_verbosity_error() 
 
 
 DATASET_PATH = "local/hf_datasets/"
-GPT4 = "gpt-4o-2024-05-13"
 REWRITE_THRESHOLD = 60
 DEFAULT_ENCODER_MODEL = os.environ.get(
     "ENCODER_DISCRIMINATOR_MODEL", "microsoft/deberta-v3-base"
@@ -49,7 +42,8 @@ class EncoderDiscriminator:
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name, 
             trust_remote_code=True,
-            output_attentions=True 
+            output_attentions=True,
+            use_safetensors=True  # avoid torch.load vulnerability path on older torch
         ).to(self.device)
         
         self.model.eval()
@@ -132,8 +126,16 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
     text = "Related news stories from search results:\n\n"
     if source == 'google':
         text += get_google_ctx(example[prefix + "title"]) + "\n\n"
+    elif source == 'wiki':
+        # Discriminator side: we skip live Wikipedia calls here; rely on generator-side context
+        return ""
+    elif source == 'none':
+        return ""
     elif source == 'dpr':
-        for rex in example[prefix + "dpr_retrieved_examples"]:
+        key = prefix + "dpr_retrieved_examples"
+        if key not in example:
+            return text
+        for rex in example[key]:
             if rex["url"] == example["url"]:
                 # skip the example itself
                 continue
@@ -146,14 +148,36 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
     return text
 
 
+def format_discriminator_input(example, rag, prefix="", description_override=None, source="dpr"):
+    """
+    Build the discriminator input text with optional RAG context and content override.
+    """
+    text = ""
+    if rag:
+        text += get_retrieval_ctx(example, prefix, source=source)
+    if text and not text.endswith("\n\n"):
+        text += "\n\n"
+
+    title = example.get(prefix + "title", "")
+    description = description_override if description_override is not None else example.get(prefix + "description", "")
+
+    raw_date = example.get(prefix + "date_publish")
+    if hasattr(raw_date, "date"):
+        date_str = str(raw_date.date())
+    else:
+        date_str = str(raw_date) if raw_date is not None else "unknown-date"
+
+    text += "Predict the plausibility of the following news story:\n\n"
+    text += f"{date_str} - {title}\n{description}\n\n"
+    return text
+
+
 def get_score(example, rag, prefix="", rationale=False, model=None):
     """
     Score the plausibility and identify suspicious words using Attention.
     """
 
-    text = get_retrieval_ctx(example, prefix) if rag else ""
-    text += "Predict the plausibility of the following news story:\n\n"
-    text += f'{example["date_publish"].date()} - {example[prefix + "title"]}\n{example[prefix + "description"]}\n\n'
+    text = format_discriminator_input(example, rag=rag, prefix=prefix)
 
     discriminator = get_encoder_discriminator()
     prob_true = discriminator.predict_prob(text)
@@ -207,18 +231,11 @@ def get_new_dataset(ds, args):
         ds = ds.select(range(10))
 
     print("=" * 80)
-    print("Initiating RAG")
-    dpr = DPR()
+    print("RAG disabled (DPR removed). Scoring positives only.")
     print("=" * 80)
 
     # score positives
     ds = ds.map(lambda example: get_score(example, rag=False), num_proc=args.num_proc)
-
-    # DPR retrieve
-    ds = ds.map(lambda example: get_dpr_results(example, dpr), num_proc=1)
-
-    # RAG score positives
-    ds = ds.map(lambda example: get_score(example, rag=True), num_proc=args.num_proc)
 
     ds.save_to_disk(str(args.path))
     return ds
@@ -229,76 +246,6 @@ def get_roc_auc(positives, negatives):
 
     probs = list(positives) + list(negatives)
     preds = [1] * len(positives) + [0] * len(negatives)
-    fpr, tpr, thresholds = metrics.roc_curve(preds, probs)
+    fpr, tpr, _ = metrics.roc_curve(preds, probs)
     roc_auc = metrics.auc(fpr, tpr)
     return roc_auc
-
-
-if __name__ == "__main__":
-    """
-    DISCLAIMER: This code is for research purposes only, specifically for studying misinformation detection
-    and improving fact-checking systems. Any use of this code for generating and spreading actual 
-    misinformation is strictly prohibited and unethical.
-    
-    RESPONSIBLE USAGE:
-    - Use only for academic research and improving detection systems
-    - Do not deploy for generating actual fake news
-    - Follow ethical guidelines for AI research
-    """
-    # create a parser
-    parser = argparse.ArgumentParser(
-        description="Research tool for studying misinformation detection through adversarial examples."
-    )
-    # add arguments to the parser
-    parser.add_argument(
-        "--source",
-        type=str,
-        help="The source dataset to be used.",
-    )
-    parser.add_argument(
-        "--target",
-        type=str,
-        help="The target dataset to be created.",
-        required=True,
-    )
-    parser.add_argument(
-        "--preflight",
-        action="store_true",
-        help="Whether to run the preflight check on about 10 examples.",
-    )
-    parser.add_argument(
-        "--first-round",
-        action="store_true",
-        help="Whether to run the first round of the game. Only in the first round, we score the positives.",
-    )
-    parser.add_argument(
-        "--num-proc", type=int, default=10, help="The number of processors to use."
-    )
-
-    # parse the arguments
-    args = parser.parse_args()
-
-
-    if not args.source:
-        ds = datasets.load_dataset('sanxing/advfake')
-        # convert the date_publish to timestamp
-        import datetime
-        ds = ds['train'].map(lambda x: {'date_publish_timestamp': datetime.datetime.strptime(x['date_publish'], '%Y-%m-%d %H:%M:%S')})
-        # drop the date_publish column
-        ds = ds.remove_columns('date_publish')
-        # change the date_publish_timestamp to date_publish
-        ds = ds.rename_column('date_publish_timestamp', 'date_publish')
-
-    else:
-        source_path = DATASET_PATH + args.source
-        # verify path
-        if not Path(source_path).exists():
-            raise ValueError(f"{DATASET_PATH + args.source} does not exist.")
-        ds = datasets.load_from_disk(source_path)
-
-    # if directory exists, give error
-    args.path = Path(f"{DATASET_PATH}{args.target}")
-    if args.path.exists():
-        raise ValueError(f"{args.path} already exists.")
-
-    ds = get_new_dataset(ds, args)

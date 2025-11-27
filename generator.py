@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import torch
 import requests
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 
 """
 1. 把功能包裝成 generator 函式，方便外部呼叫
@@ -39,7 +39,6 @@ print(fake_news)
 
 
 
-
 # ==========================================
 # 1. 配置設定 (Configuration)
 # ==========================================
@@ -54,14 +53,15 @@ MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 # ==========================================
 
 
-def search_wikipedia(query: str, num_results: int = 3, lang: str = "en") -> str:
+def search_wikipedia(query: str, num_results: int = 3, lang: str = "en", verbose: bool = False) -> str:
     """
     用 Wikipedia 官方 API 做簡單 RAG：
     1) 先用 search API 找到相關條目
     2) 再用 pageid 抓每個條目的摘要（extract）
     3) 回傳整理好的文字，給 Llama 當 Background Context
     """
-    print(f"[Wiki] query = {query!r}")
+    if verbose:
+        print(f"[Wiki] query = {query!r}")
 
     # 官方建議要帶 user-agent，避免被擋
     headers = {
@@ -81,8 +81,9 @@ def search_wikipedia(query: str, num_results: int = 3, lang: str = "en") -> str:
         }
 
         r = requests.get(search_url, params=search_params, headers=headers, timeout=10)
-        print(f"[Wiki] HTTP status = {r.status_code}")
-        print(f"[Wiki] raw text (前80字) = {r.text[:80]!r}")
+        if verbose:
+            print(f"[Wiki] HTTP status = {r.status_code}")
+            print(f"[Wiki] raw text (前80字) = {r.text[:80]!r}")
 
         # 如果不是 200，或看起來不像 JSON，就直接 fallback
         if r.status_code != 200 or not r.text.strip().startswith("{"):
@@ -137,19 +138,12 @@ def search_wikipedia(query: str, num_results: int = 3, lang: str = "en") -> str:
 
 class LlamaEngine:
     def __init__(self, model_id: str):
-        print(f"Loading model: {model_id} (4-bit quantization if supported)...")
-
-        # 使用 4-bit 量化以節省 VRAM
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4"
-        )
+        print(f"Loading model: {model_id} (fp16)")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            quantization_config=bnb_config,
+            torch_dtype=torch.float16,
             device_map="auto"
         )
 
@@ -157,9 +151,10 @@ class LlamaEngine:
             "text-generation",
             model=self.model,
             tokenizer=self.tokenizer,
-            max_new_tokens=512,
+            max_new_tokens=1024,
             temperature=0.7,
-            top_p=0.9
+            top_p=0.9,
+            return_full_text=False
         )
 
     def generate_fake_news(self, real_news, context: str, feedback_prompt: str = None) -> str:
@@ -220,7 +215,12 @@ Body: [New Body]
         )
 
         outputs = self.pipe(prompt)
-        generated_text = outputs[0]["generated_text"]
+        # pipeline 預設會回傳整個 prompt + 生成。設定 return_full_text=False 更乾淨。
+        generated_text = outputs[0].get("generated_text", "")
+
+        # 若包含前置 prompt，裁掉
+        if isinstance(generated_text, str) and prompt and generated_text.startswith(prompt):
+            generated_text = generated_text[len(prompt):]
 
         # 如果是 Llama-3.1 的 chat 模板，可能會包含特殊 token，這裡做個簡單切割
         split_tok = "<|start_header_id|>assistant<|end_header_id|>"
@@ -260,6 +260,7 @@ class FakeNewsGenerator:
         content: str,
         feedback_prompt: str = None,
         use_rag: bool = True,
+        context_override: str = None,
         rag_query: str = None,
         num_rag_results: int = 3,
         lang: str = "en"
@@ -273,6 +274,7 @@ class FakeNewsGenerator:
             feedback_prompt: 回饋提示，告訴 LLM 哪些字詞太假要避免使用
                             例如: "Avoid words like 'shocking', 'unbelievable', 'sources say'"
             use_rag: 是否使用 Wikipedia RAG 來增強背景知識
+            context_override: 外部提供的 RAG 背景，若提供則不再呼叫 Wikipedia
             rag_query: 自訂 RAG 查詢詞（若為 None，則使用 content 的前 50 個字）
             num_rag_results: Wikipedia 搜尋結果數量
             lang: Wikipedia 語言 ("en", "zh", "ja" 等)
@@ -287,10 +289,10 @@ class FakeNewsGenerator:
         }
         
         # RAG 取得背景資訊
-        rag_context = ""
-        if use_rag:
+        rag_context = context_override if context_override is not None else ""
+        if use_rag and context_override is None:
             query = rag_query if rag_query else content[:50].replace("\n", " ")
-            rag_context = search_wikipedia(query, num_results=num_rag_results, lang=lang)
+            rag_context = search_wikipedia(query, num_results=num_rag_results, lang=lang, verbose=False)
         
         # 生成假新聞
         fake_news = self.llama.generate_fake_news(real_news, rag_context, feedback_prompt)
@@ -310,6 +312,7 @@ def generator(
     rag_query: str = None,
     num_rag_results: int = 3,
     lang: str = "en",
+    context_override: str = None,
     model_id: str = None
 ) -> str:
     """
@@ -363,6 +366,7 @@ def generator(
         content=content,
         feedback_prompt=feedback_prompt,
         use_rag=use_rag,
+        context_override=context_override,
         rag_query=rag_query,
         num_rag_results=num_rag_results,
         lang=lang
