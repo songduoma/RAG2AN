@@ -6,9 +6,9 @@ set -euo pipefail
 
 DATASET_NAME="${DATASET_NAME:-cnn_dailymail}"        # HF dataset id to load (e.g., cnn_dailymail)
 DATASET_CONFIG="${DATASET_CONFIG:-3.0.0}"            # optional dataset config/version
-DATASET_SPLIT="${DATASET_SPLIT:-train}"              # HF split selector
-MAX_SAMPLES="${MAX_SAMPLES:-20}"                     # cap examples for a quick run
-NUM_ROUNDS="${NUM_ROUNDS:-10}"                       # GAN rounds (generate + train disc)
+DATASET_SPLIT="${DATASET_SPLIT:-train[:200]}"              # HF split selector
+NUM_ROUNDS="${NUM_ROUNDS:-20}"                       # GAN rounds (generate + train disc)
+LOG_INTERVAL="${LOG_INTERVAL:-10}"                   # print progress every N samples
 DISC_EPOCHS="${DISC_EPOCHS:-1}"                      # epochs per round for discriminator
 BATCH_SIZE="${BATCH_SIZE:-4}"                        # discriminator batch size
 LR="${LR:-3e-5}"                                     # discriminator learning rate
@@ -27,7 +27,6 @@ python -u gan_training.py \
   --dataset-name "$DATASET_NAME" \
   --dataset-config "$DATASET_CONFIG" \
   --dataset-split "$DATASET_SPLIT" \
-  --max-samples "$MAX_SAMPLES" \
   --num-rounds "$NUM_ROUNDS" \
   --discriminator-epochs "$DISC_EPOCHS" \
   --batch-size "$BATCH_SIZE" \
@@ -39,6 +38,7 @@ python -u gan_training.py \
   --rag-lang "$RAG_LANG" \
   --generator-model "$GEN_MODEL" \
   --discriminator-model "$DISC_MODEL" \
+  --log-interval "$LOG_INTERVAL" \
   --output-dir "$OUTPUT_DIR" \
   --max-length "${MAX_LENGTH:-384}"
 

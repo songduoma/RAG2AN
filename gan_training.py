@@ -1,8 +1,9 @@
 import argparse
 import datetime
+import math
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from datasets import Dataset as HFDataset, load_dataset, load_from_disk
@@ -63,6 +64,25 @@ def extract_article(text: str) -> Tuple[str, str]:
     return title, body
 
 
+def _slice_length_from_split(split: str) -> Optional[int]:
+    """
+    Parse dataset split expressions such as "train[:200]" to infer how many
+    examples are described by the slice. Returns None if the split cannot be
+    interpreted.
+    """
+    match = re.search(r"\[\s*([0-9]*)?\s*:\s*([0-9]*)?\s*\]", split or "")
+    if not match:
+        return None
+    start_str, end_str = match.group(1), match.group(2)
+    start = int(start_str) if start_str else 0
+    if end_str:
+        end = int(end_str)
+        if end <= start:
+            return None
+        return end - start
+    return None
+
+
 class GANTrainer:
     """
     Tie the RAG-enabled generator and discriminator into a simple GAN-style loop.
@@ -70,7 +90,7 @@ class GANTrainer:
     learns to separate real and generated samples and provides feedback.
     """
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, dataset: List[Dict[str, Any]]):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.generator = FakeNewsGenerator(model_id=args.generator_model)
@@ -79,6 +99,13 @@ class GANTrainer:
         self.optimizer = torch.optim.AdamW(self.discriminator.model.parameters(), lr=args.lr)
         self.best_loss = float("inf")
         self.best_path = None
+        if not dataset:
+            raise ValueError("Training dataset is empty; at least one example is required.")
+        self.dataset = dataset
+        self.dataset_len = len(dataset)
+        self.real_samples_per_round = self._determine_samples_per_round()
+        self.max_unique_rounds = math.ceil(self.dataset_len / self.real_samples_per_round)
+        self._wrapped_warned = False
 
     def _build_context(self, example: Dict[str, Any]) -> str:
         if self.args.rag_source == "none":
@@ -127,12 +154,13 @@ class GANTrainer:
 
         return epoch_loss / max(step, 1)
 
-    def run_round(self, round_id: int, dataset: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def run_round(self, round_id: int) -> Dict[str, Any]:
         print(f"\n===== Round {round_id} =====")
+        real_dataset = self._get_real_samples_for_round(round_id)
         real_samples: List[Dict[str, Any]] = []
         fake_samples: List[Dict[str, Any]] = []
 
-        for idx, example in enumerate(dataset, start=1):
+        for idx, example in enumerate(real_dataset, start=1):
             # Compose discriminator input for the real article.
             real_text = format_discriminator_input(
                 example,
@@ -202,8 +230,8 @@ class GANTrainer:
                 }
             )
 
-            if idx % 10 == 0:
-                total = len(dataset)
+            if idx % self.args.log_interval == 0 or idx == len(real_dataset):
+                total = len(real_dataset)
                 print(f"  Processed {idx}/{total} samples (generation + disc prep)")
 
         # Train discriminator on mixed real/fake samples.
@@ -248,6 +276,29 @@ class GANTrainer:
         print(f"  Round summary: {round_stats}")
         return round_stats
 
+    def _determine_samples_per_round(self) -> int:
+        if self.args.real_samples_per_round:
+            return max(1, min(self.args.real_samples_per_round, self.dataset_len))
+        inferred = _slice_length_from_split(self.args.dataset_split)
+        if inferred and inferred > 0:
+            return min(inferred, self.dataset_len)
+        return self.dataset_len
+
+    def _get_real_samples_for_round(self, round_id: int) -> List[Dict[str, Any]]:
+        start = (round_id - 1) * self.real_samples_per_round
+        if start >= self.dataset_len and not self._wrapped_warned:
+            print(
+                f"  Note: only {self.dataset_len} unique real samples are available "
+                f"and each round uses {self.real_samples_per_round}; "
+                f"rounds beyond {self.max_unique_rounds} will reuse examples."
+            )
+            self._wrapped_warned = True
+        start_mod = start % self.dataset_len
+        end = start_mod + self.real_samples_per_round
+        if end <= self.dataset_len:
+            return self.dataset[start_mod:end]
+        return self.dataset[start_mod:] + self.dataset[: end - self.dataset_len]
+
 
 def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
     if args.dataset_path and Path(args.dataset_path).exists():
@@ -267,9 +318,6 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
         ds = ds.sort("desc_len")
         ds = ds.select(range(len(ds) // 2))
         ds = ds.remove_columns(["desc_len"])
-
-    if args.max_samples:
-        ds = ds.select(range(args.max_samples))
 
     examples = []
     for row in ds:
@@ -296,9 +344,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RAG-GAN training loop for fake news detection.")
     parser.add_argument("--dataset-name", type=str, default="sanxing/advfake_news_please")
     parser.add_argument("--dataset-config", type=str, default=None, help="Optional dataset config/name (e.g., 3.0.0 for cnn_dailymail).")
-    parser.add_argument("--dataset-split", type=str, default="train[:64]")
+    parser.add_argument("--dataset-split", type=str, default="train")
     parser.add_argument("--dataset-path", type=str, help="Optional local dataset path (load_from_disk).")
-    parser.add_argument("--max-samples", type=int, default=64, help="Limit number of samples for a quick run.")
     parser.add_argument("--num-rounds", type=int, default=2)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -315,6 +362,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generator-model", type=str, default=MODEL_ID)
     parser.add_argument("--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL)
     parser.add_argument("--output-dir", type=str, help="Where to save generated fakes per round.")
+    parser.add_argument("--log-interval", type=int, default=10, help="Number of samples between progress logs.")
+    parser.add_argument(
+        "--real-samples-per-round",
+        type=int,
+        help="Number of real samples to cycle through each round to keep batches disjoint.",
+    )
 
     parser.set_defaults(disc_use_rag=False, generator_use_wiki=True)
     return parser.parse_args()
@@ -325,9 +378,12 @@ def main() -> None:
     dataset = load_news_data(args)
 
     print(f"Loaded {len(dataset)} examples for training.")
-    trainer = GANTrainer(args)
+    if args.log_interval <= 0:
+        raise ValueError("--log-interval must be positive.")
+
+    trainer = GANTrainer(args, dataset)
     for round_id in range(1, args.num_rounds + 1):
-        trainer.run_round(round_id, dataset)
+        trainer.run_round(round_id)
 
 
 if __name__ == "__main__":
