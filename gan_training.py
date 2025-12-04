@@ -16,7 +16,13 @@ from discriminator import (
     get_encoder_discriminator,
     get_retrieval_ctx,
 )
-from generator import MODEL_ID, FakeNewsGenerator, search_wikipedia
+from generator import (
+    MODEL_ID,
+    GEN_MODE,
+    OPENAI_MODEL,
+    FakeNewsGenerator,
+    search_wikipedia,
+)
 
 
 class TextDataset(Dataset):
@@ -88,38 +94,71 @@ class GANTrainer:
     Tie the RAG-enabled generator and discriminator into a simple GAN-style loop.
     The generator crafts fake news with retrieval context, while the discriminator
     learns to separate real and generated samples and provides feedback.
+
+    Enhanced with:
+    - Dynamic balancing: Skip D training when G is too weak
+    - Few-shot learning: Include successful examples in feedback
+    - Label smoothing: Soften D's learning signal
     """
 
     def __init__(self, args: argparse.Namespace, dataset: List[Dict[str, Any]]):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.generator = FakeNewsGenerator(model_id=args.generator_model)
-        self.discriminator = get_encoder_discriminator(model_name=args.discriminator_model)
+        self.discriminator = get_encoder_discriminator(
+            model_name=args.discriminator_model
+        )
         self.discriminator.model.train()
-        self.optimizer = torch.optim.AdamW(self.discriminator.model.parameters(), lr=args.lr)
+        self.optimizer = torch.optim.AdamW(
+            self.discriminator.model.parameters(), lr=args.lr
+        )
         self.best_loss = float("inf")
         self.best_path = None
         if not dataset:
-            raise ValueError("Training dataset is empty; at least one example is required.")
+            raise ValueError(
+                "Training dataset is empty; at least one example is required."
+            )
         self.dataset = dataset
         self.dataset_len = len(dataset)
         self.real_samples_per_round = self._determine_samples_per_round()
-        self.max_unique_rounds = math.ceil(self.dataset_len / self.real_samples_per_round)
+        self.max_unique_rounds = math.ceil(
+            self.dataset_len / self.real_samples_per_round
+        )
         self._wrapped_warned = False
+
+        # === 新增：動態平衡與 Few-shot 學習 ===
+        self.successful_examples = []  # 存儲騙過 D 的成功案例 (最多保留 5 個)
+        self.last_fool_rate = 0.0  # 追蹤上一輪的 fool rate
+        self.rounds_without_training = 0  # 連續幾輪沒訓練 D
+
+        # 動態平衡參數（可透過 args 調整）
+        self.min_fool_rate_to_train = getattr(
+            args, "min_fool_rate_to_train", 0.05
+        )  # 低於此值暫停訓練 D
+        self.max_skip_rounds = getattr(args, "max_skip_rounds", 2)  # 最多連續跳過幾輪
+        self.label_smoothing = getattr(
+            args, "label_smoothing", 0.1
+        )  # Label smoothing 係數
 
     def _build_context(self, example: Dict[str, Any]) -> str:
         if self.args.rag_source == "none":
             return ""
         if self.args.rag_source == "wiki":
             query = example.get("title") or str(example.get("description", ""))[:50]
-            return search_wikipedia(query, num_results=self.args.num_rag_results, lang=self.args.rag_lang)
+            return search_wikipedia(
+                query, num_results=self.args.num_rag_results, lang=self.args.rag_lang
+            )
         if self.args.rag_source == "google":
             return get_retrieval_ctx(example, prefix="", source="google")
         return ""
 
     def _collate(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         texts = [item["text"] for item in batch]
-        labels = torch.tensor([item["label"] for item in batch], dtype=torch.long, device=self.discriminator.device)
+        labels = torch.tensor(
+            [item["label"] for item in batch],
+            dtype=torch.long,
+            device=self.discriminator.device,
+        )
         encoded = self.discriminator.tokenizer(
             texts,
             truncation=True,
@@ -130,7 +169,13 @@ class GANTrainer:
         encoded["labels"] = labels
         return encoded
 
-    def _train_discriminator(self, samples: List[Dict[str, Any]]) -> float:
+    def _train_discriminator(
+        self, samples: List[Dict[str, Any]], use_label_smoothing: bool = True
+    ) -> float:
+        """
+        Train discriminator with optional label smoothing to slow down learning.
+        Label smoothing: soft labels like 0.9/0.1 instead of 1.0/0.0
+        """
         dataloader = DataLoader(
             TextDataset(samples),
             batch_size=self.args.batch_size,
@@ -139,16 +184,32 @@ class GANTrainer:
         )
         epoch_loss = 0.0
         step = 0
+
         for batch in dataloader:
             outputs = self.discriminator.model(**batch)
-            loss = outputs.loss
+
+            # Label smoothing: 讓 D 學得慢一點
+            if use_label_smoothing and self.label_smoothing > 0:
+                # 原本 loss 是用 hard labels，這裡用 soft labels 重新計算
+                logits = outputs.logits
+                labels = batch["labels"]
+                num_classes = logits.shape[-1]
+
+                # Soft labels: [0.1, 0.9] for real, [0.9, 0.1] for fake (if smoothing=0.1)
+                smooth = self.label_smoothing
+                soft_labels = torch.full_like(logits, smooth / (num_classes - 1))
+                soft_labels.scatter_(1, labels.unsqueeze(1), 1.0 - smooth)
+
+                # Cross entropy with soft labels
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                loss = -(soft_labels * log_probs).sum(dim=-1).mean()
+            else:
+                loss = outputs.loss
+
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-            with torch.no_grad():
-                preds = outputs.logits.argmax(dim=-1)
-                acc = (preds == batch["labels"]).float().mean().item()
             epoch_loss += loss.item()
             step += 1
 
@@ -172,7 +233,11 @@ class GANTrainer:
 
             # Build retrieval context for the generator.
             rag_context = self._build_context(example)
-            if self.args.filter_no_wiki and self.args.rag_source == "wiki" and not rag_context.strip():
+            if (
+                self.args.filter_no_wiki
+                and self.args.rag_source == "wiki"
+                and not rag_context.strip()
+            ):
                 # skip samples with no wiki hits when filtering is enabled
                 continue
             # Only allow Wikipedia fallback when rag_source explicitly asks for wiki
@@ -209,24 +274,77 @@ class GANTrainer:
             # Temporarily switch to eval mode for stable inference; restore original mode after.
             prev_training = self.discriminator.model.training
             self.discriminator.model.eval()
-            fake_prob_true = self.discriminator.predict_prob(fake_disc_input)
-            suspicious = self.discriminator.get_suspicious_words(fake_disc_input)
+
+            # 使用強化版的 detailed feedback
+            detailed = self.discriminator.get_detailed_feedback(
+                fake_disc_input, rag_context=rag_context, top_k=5
+            )
+            fake_prob_true = detailed["prob_true"]
+            suspicious = ", ".join(
+                [f"{w}({s:.2f})" for w, s in detailed["suspicious_words"]]
+            )
+
             if prev_training:
                 self.discriminator.model.train()
 
-            # Feedback is stored back into the example for the next round.
-            example["feedback_prompt"] = (
-                f"Your last version looked suspicious because of: {suspicious}. "
-                f"Rewrite to be more consistent with the retrieved context."
+            # 強化版 Feedback Prompt - 這是 "Verbal Adversarial Feedback" 的核心
+            feedback_lines = [
+                f"=== DISCRIMINATOR FEEDBACK (Round {round_id}) ===",
+                f"Detection Result: Your previous version was classified as FAKE",
+                f"Confidence: {detailed['confidence'].upper()} ({detailed['prob_fake']:.1%} fake probability)",
+                "",
+                "Problems Identified:",
+            ]
+
+            for i, reason in enumerate(detailed["detection_reasons"], 1):
+                reason_readable = reason.replace("_", " ").title()
+                feedback_lines.append(f"  {i}. {reason_readable}")
+
+            feedback_lines.append("")
+            feedback_lines.append(f"Flagged Suspicious Terms: {suspicious}")
+            feedback_lines.append("")
+            feedback_lines.append("Improvement Instructions:")
+
+            for i, suggestion in enumerate(detailed["improvement_suggestions"], 1):
+                feedback_lines.append(f"  {i}. {suggestion}")
+
+            # === 新增：Few-shot 成功案例 ===
+            if self.successful_examples:
+                feedback_lines.append("")
+                feedback_lines.append("=" * 50)
+                feedback_lines.append("SUCCESSFUL EXAMPLE (This fooled the detector!):")
+                feedback_lines.append("=" * 50)
+                # 取最近一個成功案例
+                best_example = self.successful_examples[-1]
+                # 只取前 500 字避免 prompt 太長
+                feedback_lines.append(best_example["text"][:500])
+                feedback_lines.append("...")
+                feedback_lines.append(
+                    f"[This achieved {best_example['prob_true']:.1%} real probability]"
+                )
+                feedback_lines.append("")
+                feedback_lines.append(
+                    "LEARN FROM THIS: Mimic the style and tone of the successful example above."
+                )
+
+            feedback_lines.append("")
+            feedback_lines.append(
+                "CRITICAL: Your rewrite MUST address these issues to pass detection."
             )
+
+            example["feedback_prompt"] = "\n".join(feedback_lines)
 
             fake_samples.append(
                 {
                     "text": fake_disc_input,
                     "label": 0,
                     "prob_true": fake_prob_true,
+                    "prob_fake": detailed["prob_fake"],
+                    "confidence": detailed["confidence"],
                     "suspicious_words": suspicious,
+                    "detection_reasons": detailed["detection_reasons"],
                     "feedback_prompt": example["feedback_prompt"],
+                    "generated_content": clean_generated,  # 保存生成內容，用於 few-shot
                 }
             )
 
@@ -234,12 +352,80 @@ class GANTrainer:
                 total = len(real_dataset)
                 print(f"  Processed {idx}/{total} samples (generation + disc prep)")
 
+        # === 新增：先計算 fool_rate，收集成功案例 ===
+        prob_trues = [s["prob_true"] for s in fake_samples]
+        fooled_count = sum(1 for p in prob_trues if p > 0.5)
+        fool_rate = fooled_count / max(len(prob_trues), 1)
+
+        # 收集成功騙過 D 的案例（prob_true > 0.5）
+        new_successes = [s for s in fake_samples if s["prob_true"] > 0.5]
+        if new_successes:
+            # 按 prob_true 排序，取最好的
+            new_successes.sort(key=lambda x: x["prob_true"], reverse=True)
+            for s in new_successes[:3]:  # 最多加 3 個
+                self.successful_examples.append(
+                    {
+                        "text": s.get("generated_content", s["text"][:500]),
+                        "prob_true": s["prob_true"],
+                    }
+                )
+            # 只保留最近 5 個成功案例
+            self.successful_examples = self.successful_examples[-5:]
+            print(
+                f"  ✓ Collected {len(new_successes)} successful examples (total: {len(self.successful_examples)})"
+            )
+
+        # === 新增：動態平衡 - 決定是否訓練 D ===
+        skip_training = False
+        training_reason = ""
+
+        if fool_rate < self.min_fool_rate_to_train:
+            if self.rounds_without_training < self.max_skip_rounds:
+                skip_training = True
+                self.rounds_without_training += 1
+                training_reason = f"SKIPPED (fool_rate {fool_rate:.1%} < {self.min_fool_rate_to_train:.1%}, giving G time to improve)"
+            else:
+                training_reason = f"FORCED (skipped {self.rounds_without_training} rounds, must train)"
+                self.rounds_without_training = 0
+        else:
+            self.rounds_without_training = 0
+            training_reason = f"NORMAL (fool_rate {fool_rate:.1%} >= {self.min_fool_rate_to_train:.1%})"
+
         # Train discriminator on mixed real/fake samples.
         mixed_samples = real_samples + fake_samples
         avg_loss = 0.0
-        for epoch in range(self.args.discriminator_epochs):
-            print(f"  Training discriminator epoch {epoch + 1}/{self.args.discriminator_epochs}")
-            avg_loss = self._train_discriminator(mixed_samples)
+
+        if skip_training:
+            print(f"  ⏸️  Discriminator training: {training_reason}")
+            # 還是要計算 loss 用於統計，但不更新參數
+            self.discriminator.model.eval()
+            with torch.no_grad():
+                for s in mixed_samples[: self.args.batch_size]:
+                    inputs = self.discriminator.tokenizer(
+                        s["text"],
+                        truncation=True,
+                        padding=True,
+                        max_length=self.args.max_length,
+                        return_tensors="pt",
+                    ).to(self.discriminator.device)
+                    inputs["labels"] = torch.tensor(
+                        [s["label"]], device=self.discriminator.device
+                    )
+                    outputs = self.discriminator.model(**inputs)
+                    avg_loss += outputs.loss.item()
+                avg_loss /= min(len(mixed_samples), self.args.batch_size)
+            self.discriminator.model.train()
+        else:
+            print(f"  ▶️  Discriminator training: {training_reason}")
+            for epoch in range(self.args.discriminator_epochs):
+                print(
+                    f"  Training discriminator epoch {epoch + 1}/{self.args.discriminator_epochs} (with label smoothing={self.label_smoothing})"
+                )
+                avg_loss = self._train_discriminator(
+                    mixed_samples, use_label_smoothing=True
+                )
+
+        self.last_fool_rate = fool_rate
 
         if self.args.output_dir:
             out_dir = Path(self.args.output_dir) / f"round_{round_id}"
@@ -247,14 +433,61 @@ class GANTrainer:
             HFDataset.from_list(fake_samples).save_to_disk(out_dir)
             print(f"  Saved generated fakes to {out_dir}")
 
+        # 計算更詳細的統計指標（prob_trues, fooled_count, fool_rate 已在前面計算）
+        mean_prob_true = sum(prob_trues) / max(len(prob_trues), 1)
+        min_prob_true = min(prob_trues) if prob_trues else 0
+        max_prob_true = max(prob_trues) if prob_trues else 0
+
+        # 統計 confidence 分布
+        confidence_dist = {"high": 0, "medium": 0, "low": 0}
+        for s in fake_samples:
+            conf = s.get("confidence", "high")
+            confidence_dist[conf] = confidence_dist.get(conf, 0) + 1
+
+        # 統計 detection reasons 分布
+        reason_dist = {}
+        for s in fake_samples:
+            for reason in s.get("detection_reasons", []):
+                reason_dist[reason] = reason_dist.get(reason, 0) + 1
+
         round_stats = {
+            "round": round_id,
             "avg_disc_loss": avg_loss,
             "num_fake": len(fake_samples),
             "num_real": len(real_samples),
-            "mean_fake_prob_true": float(
-                sum(s["prob_true"] for s in fake_samples) / max(len(fake_samples), 1)
-            ),
+            # Generator 進步指標 (這些是關鍵！)
+            "mean_fake_prob_true": float(mean_prob_true),
+            "min_fake_prob_true": float(min_prob_true),
+            "max_fake_prob_true": float(max_prob_true),
+            "fool_rate": float(fool_rate),  # 成功欺騙 D 的比例
+            "fooled_count": fooled_count,
+            # Detection 分析
+            "confidence_distribution": confidence_dist,
+            "detection_reasons": reason_dist,
+            # 動態平衡資訊
+            "disc_training_skipped": skip_training,
+            "successful_examples_count": len(self.successful_examples),
         }
+
+        # 印出關鍵指標（方便觀察 G vs D 動態）
+        print(f"\n  ┌─────────────────────────────────────────────────────")
+        print(f"  │ ROUND {round_id} SUMMARY - Verbal Adversarial Feedback")
+        print(f"  ├─────────────────────────────────────────────────────")
+        print(f"  │ Generator Performance:")
+        print(f"  │   Mean P(real): {mean_prob_true:.3f}  (↑ = G improving)")
+        print(
+            f"  │   Fool Rate:    {fool_rate:.1%} ({fooled_count}/{len(prob_trues)} samples)"
+        )
+        print(f"  │   Range:        [{min_prob_true:.3f}, {max_prob_true:.3f}]")
+        print(f"  │   Few-shot Examples: {len(self.successful_examples)} stored")
+        print(f"  │ Discriminator:")
+        print(f"  │   Training:     {'SKIPPED ⏸️' if skip_training else 'ACTIVE ▶️'}")
+        print(f"  │   Avg Loss:     {avg_loss:.4f}  (↓ = D improving)")
+        print(
+            f"  │   Confidence:   H:{confidence_dist['high']} M:{confidence_dist['medium']} L:{confidence_dist['low']}"
+        )
+        print(f"  │ Detection Reasons: {reason_dist}")
+        print(f"  └─────────────────────────────────────────────────────\n")
 
         # Save discriminator checkpoints (best + last)
         if self.args.output_dir:
@@ -311,9 +544,11 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     # For CNN/DailyMail: drop the longer half based on article/description length
     if args.dataset_name == "cnn_dailymail":
+
         def _len_fn(x):
             article = x.get("article", "") or x.get("description", "")
             return {"desc_len": len(article)}
+
         ds = ds.map(_len_fn, num_proc=1)
         ds = ds.sort("desc_len")
         ds = ds.select(range(len(ds) // 2))
@@ -341,32 +576,96 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RAG-GAN training loop for fake news detection.")
-    parser.add_argument("--dataset-name", type=str, default="sanxing/advfake_news_please")
-    parser.add_argument("--dataset-config", type=str, default=None, help="Optional dataset config/name (e.g., 3.0.0 for cnn_dailymail).")
+    parser = argparse.ArgumentParser(
+        description="RAG-GAN training loop for fake news detection."
+    )
+    parser.add_argument(
+        "--dataset-name", type=str, default="sanxing/advfake_news_please"
+    )
+    parser.add_argument(
+        "--dataset-config",
+        type=str,
+        default=None,
+        help="Optional dataset config/name (e.g., 3.0.0 for cnn_dailymail).",
+    )
     parser.add_argument("--dataset-split", type=str, default="train")
-    parser.add_argument("--dataset-path", type=str, help="Optional local dataset path (load_from_disk).")
+    parser.add_argument(
+        "--dataset-path", type=str, help="Optional local dataset path (load_from_disk)."
+    )
     parser.add_argument("--num-rounds", type=int, default=2)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max-length", type=int, default=MAX_ENCODER_SEQ_LEN)
-    parser.add_argument("--rag-source", type=str, choices=["google", "wiki", "none"], default="wiki")
-    parser.add_argument("--disc-use-rag", action="store_true", help="Enable RAG for discriminator input.")
-    parser.add_argument("--no-disc-rag", dest="disc_use_rag", action="store_false", help="Disable RAG for discriminator input.")
-    parser.add_argument("--generator-use-wiki", action="store_true", help="Use Wikipedia when no external context is provided.")
-    parser.add_argument("--no-generator-wiki", dest="generator_use_wiki", action="store_false", help="Disable Wikipedia fallback.")
-    parser.add_argument("--filter-no-wiki", action="store_true", help="Skip samples whose wiki search returns empty context.")
+    parser.add_argument(
+        "--rag-source", type=str, choices=["google", "wiki", "none"], default="wiki"
+    )
+    parser.add_argument(
+        "--disc-use-rag",
+        action="store_true",
+        help="Enable RAG for discriminator input.",
+    )
+    parser.add_argument(
+        "--no-disc-rag",
+        dest="disc_use_rag",
+        action="store_false",
+        help="Disable RAG for discriminator input.",
+    )
+    parser.add_argument(
+        "--generator-use-wiki",
+        action="store_true",
+        help="Use Wikipedia when no external context is provided.",
+    )
+    parser.add_argument(
+        "--no-generator-wiki",
+        dest="generator_use_wiki",
+        action="store_false",
+        help="Disable Wikipedia fallback.",
+    )
+    parser.add_argument(
+        "--filter-no-wiki",
+        action="store_true",
+        help="Skip samples whose wiki search returns empty context.",
+    )
     parser.add_argument("--num-rag-results", type=int, default=3)
     parser.add_argument("--rag-lang", type=str, default="en")
     parser.add_argument("--generator-model", type=str, default=MODEL_ID)
-    parser.add_argument("--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL)
-    parser.add_argument("--output-dir", type=str, help="Where to save generated fakes per round.")
-    parser.add_argument("--log-interval", type=int, default=10, help="Number of samples between progress logs.")
+    parser.add_argument(
+        "--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL
+    )
+    parser.add_argument(
+        "--output-dir", type=str, help="Where to save generated fakes per round."
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Number of samples between progress logs.",
+    )
     parser.add_argument(
         "--real-samples-per-round",
         type=int,
         help="Number of real samples to cycle through each round to keep batches disjoint.",
+    )
+
+    # === 動態平衡參數 ===
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.1,
+        help="Label smoothing coefficient for discriminator training (0.0 = no smoothing, 0.1 = recommended).",
+    )
+    parser.add_argument(
+        "--min-fool-rate-to-train",
+        type=float,
+        default=0.05,
+        help="Skip discriminator training if fool rate is below this threshold (gives G time to improve).",
+    )
+    parser.add_argument(
+        "--max-skip-rounds",
+        type=int,
+        default=2,
+        help="Maximum consecutive rounds to skip discriminator training.",
     )
 
     parser.set_defaults(disc_use_rag=False, generator_use_wiki=True)
@@ -374,7 +673,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    import json
+
     args = parse_args()
+
+    # 顯示 Generator 模式
+    print("\n" + "=" * 60)
+    print("RAG²AN - Verbal Adversarial Feedback Training")
+    print("=" * 60)
+    print(f"Generator Mode: {GEN_MODE.upper()}")
+    if GEN_MODE == "api":
+        print(f"  API Model: {OPENAI_MODEL}")
+    else:
+        print(f"  Local Model: {MODEL_ID}")
+    print(f"Discriminator: {args.discriminator_model}")
+    print("=" * 60 + "\n")
+
     dataset = load_news_data(args)
 
     print(f"Loaded {len(dataset)} examples for training.")
@@ -382,8 +696,45 @@ def main() -> None:
         raise ValueError("--log-interval must be positive.")
 
     trainer = GANTrainer(args, dataset)
+    all_stats = []
+
     for round_id in range(1, args.num_rounds + 1):
-        trainer.run_round(round_id)
+        stats = trainer.run_round(round_id)
+        all_stats.append(stats)
+
+    # 保存完整的訓練歷史到 JSON
+    if args.output_dir:
+        history_path = Path(args.output_dir) / "training_history.json"
+        with open(history_path, "w") as f:
+            json.dump(all_stats, f, indent=2, default=str)
+        print(f"\nTraining history saved to: {history_path}")
+
+        # 印出最終摘要
+        print("\n" + "=" * 60)
+        print("FINAL TRAINING SUMMARY")
+        print("=" * 60)
+        print(f"{'Round':<8} {'Mean P(real)':<14} {'Fool Rate':<12} {'Disc Loss':<12}")
+        print("-" * 60)
+        for s in all_stats:
+            print(
+                f"{s['round']:<8} {s['mean_fake_prob_true']:<14.3f} {s['fool_rate']:<12.1%} {s['avg_disc_loss']:<12.4f}"
+            )
+        print("=" * 60)
+
+        # 計算整體趨勢
+        if len(all_stats) >= 2:
+            first_fool_rate = all_stats[0]["fool_rate"]
+            last_fool_rate = all_stats[-1]["fool_rate"]
+            first_mean_p = all_stats[0]["mean_fake_prob_true"]
+            last_mean_p = all_stats[-1]["mean_fake_prob_true"]
+
+            print(f"\nGenerator Trend:")
+            print(
+                f"  Fool Rate:    {first_fool_rate:.1%} → {last_fool_rate:.1%} ({'↑ IMPROVING' if last_fool_rate > first_fool_rate else '↓ declining'})"
+            )
+            print(
+                f"  Mean P(real): {first_mean_p:.3f} → {last_mean_p:.3f} ({'↑ IMPROVING' if last_mean_p > first_mean_p else '↓ declining'})"
+            )
 
 
 if __name__ == "__main__":

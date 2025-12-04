@@ -10,7 +10,7 @@ from transformers import (
 
 from search import get_google_ctx
 
-logging.set_verbosity_error() 
+logging.set_verbosity_error()
 
 
 DATASET_PATH = "local/hf_datasets/"
@@ -37,22 +37,20 @@ class EncoderDiscriminator:
         self.max_length = max_length
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        
+
         # 加入 output_attentions=True
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, 
+            model_name,
             trust_remote_code=True,
             output_attentions=True,
-            use_safetensors=True  # avoid torch.load vulnerability path on older torch
+            use_safetensors=True,  # avoid torch.load vulnerability path on older torch
         ).to(self.device)
-        
+
         self.model.eval()
         self.positive_label_id = self._detect_positive_label_id()
 
     def _detect_positive_label_id(self) -> int:
-        id2label = {
-            int(k): v for k, v in self.model.config.id2label.items()
-        }
+        id2label = {int(k): v for k, v in self.model.config.id2label.items()}
         for idx, label in id2label.items():
             label_lower = label.lower()
             if any(
@@ -85,53 +83,208 @@ class EncoderDiscriminator:
             max_length=self.max_length,
             return_tensors="pt",
         ).to(self.device)
-        
+
         outputs = self.model(**inputs)
-        
+
         # 1. 抓取最後一層 Attention
         attentions = outputs.attentions[-1].cpu()
         # 2. 平均所有 Head
         avg_att = torch.mean(attentions, dim=1).squeeze(0)
         # 3. 取出 [CLS] 對其他 token 的關注度
         cls_att = avg_att[0, :]
-        
+
         # 4. 處理 Token (過濾特殊符號)
-        input_ids = inputs['input_ids'][0].cpu().numpy()
+        input_ids = inputs["input_ids"][0].cpu().numpy()
         special_mask = [
-            x in [self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.pad_token_id] 
+            x
+            in [
+                self.tokenizer.cls_token_id,
+                self.tokenizer.sep_token_id,
+                self.tokenizer.pad_token_id,
+            ]
             for x in input_ids
         ]
         # 將特殊 token 分數歸零，避免選中
         cls_att[special_mask] = 0
-        
+
         # 5. 找出分數最高的 Top-K
         values, indices = torch.topk(cls_att, k=min(top_k, len(cls_att)))
-        
+
         suspicious_list = []
         for idx, val in zip(indices, values):
             # 解碼回文字
             word = self.tokenizer.decode([input_ids[idx]])
             suspicious_list.append(f"{word}({val:.2f})")
-            
+
         return ", ".join(suspicious_list)
+
+    @torch.no_grad()
+    def get_detailed_feedback(
+        self, text: str, rag_context: str = "", top_k: int = 5
+    ) -> dict:
+        """
+        提供更詳細的分析結果，用於強化 Generator 的 feedback。
+
+        Returns:
+            dict: {
+                "prob_true": float,           # 被判為真的機率
+                "prob_fake": float,           # 被判為假的機率
+                "confidence": str,            # 置信度等級 (high/medium/low)
+                "suspicious_words": list,     # [(word, score), ...]
+                "top_suspicious": str,        # 最可疑的詞
+                "detection_reason": str,      # 被偵測到的主要原因
+                "improvement_suggestions": list,  # 改進建議
+            }
+        """
+        inputs = self.tokenizer(
+            text,
+            truncation=True,
+            padding=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        ).to(self.device)
+
+        outputs = self.model(**inputs)
+
+        # 計算機率
+        probs = torch.softmax(outputs.logits, dim=-1)
+        prob_true = probs[0, self.positive_label_id].item()
+        prob_fake = 1 - prob_true
+
+        # 判斷置信度
+        if prob_fake > 0.8:
+            confidence = "high"
+        elif prob_fake > 0.6:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # 抓取 attention 分析可疑詞
+        attentions = outputs.attentions[-1].cpu()
+        avg_att = torch.mean(attentions, dim=1).squeeze(0)
+        cls_att = avg_att[0, :]
+
+        input_ids = inputs["input_ids"][0].cpu().numpy()
+        special_mask = [
+            x
+            in [
+                self.tokenizer.cls_token_id,
+                self.tokenizer.sep_token_id,
+                self.tokenizer.pad_token_id,
+            ]
+            for x in input_ids
+        ]
+        cls_att[special_mask] = 0
+
+        values, indices = torch.topk(cls_att, k=min(top_k, len(cls_att)))
+
+        suspicious_words = []
+        for idx, val in zip(indices, values):
+            word = self.tokenizer.decode([input_ids[idx]]).strip()
+            if word:  # 過濾空字串
+                suspicious_words.append((word, val.item()))
+
+        top_suspicious = suspicious_words[0][0] if suspicious_words else ""
+
+        # 分析偵測原因
+        detection_reasons = []
+        word_texts = [w[0].lower() for w in suspicious_words]
+
+        # 檢查常見假新聞特徵
+        sensational_words = [
+            "shocking",
+            "unbelievable",
+            "secret",
+            "exposed",
+            "bombshell",
+            "stunning",
+        ]
+        vague_sources = [
+            "sources say",
+            "reportedly",
+            "allegedly",
+            "anonymous",
+            "insiders",
+        ]
+
+        for word in word_texts:
+            if any(s in word for s in sensational_words):
+                detection_reasons.append("sensationalist_language")
+                break
+
+        for word in word_texts:
+            if any(s in word for s in vague_sources):
+                detection_reasons.append("vague_attribution")
+                break
+
+        if prob_fake > 0.7 and not detection_reasons:
+            detection_reasons.append("factual_inconsistency")
+
+        if not detection_reasons:
+            detection_reasons.append("style_mismatch")
+
+        # 生成改進建議
+        suggestions = []
+
+        if "sensationalist_language" in detection_reasons:
+            suggestions.append(
+                f"Replace sensationalist words like '{top_suspicious}' with neutral alternatives"
+            )
+
+        if "vague_attribution" in detection_reasons:
+            suggestions.append(
+                "Use specific, named sources instead of vague attributions"
+            )
+
+        if "factual_inconsistency" in detection_reasons:
+            suggestions.append(
+                "Ensure all facts align with the provided background context"
+            )
+
+        if "style_mismatch" in detection_reasons:
+            suggestions.append(
+                "Match the formal, objective tone of professional journalism"
+            )
+
+        # 通用建議
+        suggestions.append(
+            f"Avoid or rephrase these flagged terms: {', '.join(word_texts[:3])}"
+        )
+
+        if rag_context:
+            suggestions.append(
+                "Cross-reference your claims with the RAG context provided"
+            )
+
+        return {
+            "prob_true": prob_true,
+            "prob_fake": prob_fake,
+            "confidence": confidence,
+            "suspicious_words": suspicious_words,
+            "top_suspicious": top_suspicious,
+            "detection_reasons": detection_reasons,
+            "improvement_suggestions": suggestions,
+        }
 
 
 @lru_cache(maxsize=1)
-def get_encoder_discriminator(model_name: str = DEFAULT_ENCODER_MODEL) -> EncoderDiscriminator:
+def get_encoder_discriminator(
+    model_name: str = DEFAULT_ENCODER_MODEL,
+) -> EncoderDiscriminator:
     return EncoderDiscriminator(model_name=model_name)
 
 
 def get_retrieval_ctx(example, prefix, source="dpr"):
     cnt = 0
     text = "Related news stories from search results:\n\n"
-    if source == 'google':
+    if source == "google":
         text += get_google_ctx(example[prefix + "title"]) + "\n\n"
-    elif source == 'wiki':
+    elif source == "wiki":
         # Discriminator side: we skip live Wikipedia calls here; rely on generator-side context
         return ""
-    elif source == 'none':
+    elif source == "none":
         return ""
-    elif source == 'dpr':
+    elif source == "dpr":
         key = prefix + "dpr_retrieved_examples"
         if key not in example:
             return text
@@ -139,7 +292,7 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
             if rex["url"] == example["url"]:
                 # skip the example itself
                 continue
-            text += f'{rex["date_publish"].date()} - {rex["title"]}\n{rex["url"]}\n{rex["description"]}\n\n'
+            text += f"{rex['date_publish'].date()} - {rex['title']}\n{rex['url']}\n{rex['description']}\n\n"
             cnt += 1
             if cnt == 5:
                 break
@@ -148,7 +301,9 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
     return text
 
 
-def format_discriminator_input(example, rag, prefix="", description_override=None, source="dpr"):
+def format_discriminator_input(
+    example, rag, prefix="", description_override=None, source="dpr"
+):
     """
     Build the discriminator input text with optional RAG context and content override.
     """
@@ -159,7 +314,11 @@ def format_discriminator_input(example, rag, prefix="", description_override=Non
         text += "\n\n"
 
     title = example.get(prefix + "title", "")
-    description = description_override if description_override is not None else example.get(prefix + "description", "")
+    description = (
+        description_override
+        if description_override is not None
+        else example.get(prefix + "description", "")
+    )
 
     raw_date = example.get(prefix + "date_publish")
     if hasattr(raw_date, "date"):
@@ -181,7 +340,7 @@ def get_score(example, rag, prefix="", rationale=False, model=None):
 
     discriminator = get_encoder_discriminator()
     prob_true = discriminator.predict_prob(text)
-    
+
     # 在這裡呼叫抓字功能
     suspicious_words = discriminator.get_suspicious_words(text, top_k=5)
 
@@ -201,9 +360,8 @@ def get_score(example, rag, prefix="", rationale=False, model=None):
         prefix + "majority": majority,
         prefix + "prob_true": prob_true,
         # 把結果存進 Dataset 裡，使得 Generator 讀得到
-        prefix + "suspicious_words": suspicious_words 
+        prefix + "suspicious_words": suspicious_words,
     }
-
 
 
 def get_dpr_results(example, dpr, search_key="title", prefix=""):
