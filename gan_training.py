@@ -55,19 +55,41 @@ def _normalize_date(raw_date: Any) -> Any:
 def extract_article(text: str) -> Tuple[str, str]:
     """
     Extract generated Title/Body from the generator output, removing system/user prompt.
+    
+    Handles multiple formats:
+    1. Explicit format: "Title: ...\nBody: ..."
+    2. Implicit format: First line as title, rest as body
     """
     if not isinstance(text, str):
         return "", ""
-    title, body = "", text
+    
+    text = text.strip()
+    if not text:
+        return "", ""
+    
+    # Case 1: Explicit Title:/Body: format
     if "Title:" in text:
         parts = text.split("Title:", 1)[1]
         if "Body:" in parts:
             title_part, body_part = parts.split("Body:", 1)
             title = title_part.strip().splitlines()[0] if title_part.strip() else ""
             body = body_part.strip()
+            return title, body
         else:
+            # Has "Title:" but no "Body:" - treat rest as body
             body = parts.strip()
-    return title, body
+            return "", body
+    
+    # Case 2: No explicit markers - use first line as title
+    lines = text.split('\n', 1)
+    if len(lines) == 1:
+        # Single line - treat as body
+        return "", lines[0].strip()
+    else:
+        # Multiple lines - first line is title
+        title = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        return title, body
 
 
 def _slice_length_from_split(split: str) -> Optional[int]:

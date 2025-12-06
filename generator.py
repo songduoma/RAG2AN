@@ -141,8 +141,8 @@ class APIEngine:
                 "Your goal: rewrite the news to introduce subtle factual errors while EVADING detection. "
                 "KEY STRATEGY: The detector flagged specific words and patterns. You MUST avoid these tells. "
                 "Write in a neutral, professional journalistic tone. Avoid sensationalism. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "CRITICAL FORMAT: You MUST output in 'Title:' and 'Body:' format. "
+                "The Title should be a single line. The Body should follow on a new line after 'Body:'."
             )
         else:
             system_prompt = (
@@ -150,8 +150,8 @@ class APIEngine:
                 "to introduce believable factual errors or alter key entities (names, locations, events) "
                 "while maintaining the EXACT same journalistic tone and formatting style as the original. "
                 "The goal is to create a piece of 'Fake News' that is plausible enough to fool fact-checkers. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "CRITICAL FORMAT: You MUST output in 'Title:' and 'Body:' format. "
+                "The Title should be a single line. The Body should follow on a new line after 'Body:'."
             )
 
         # 構建 feedback section
@@ -183,11 +183,13 @@ Original Real News:
 Task:
 Rewrite the news above to be fake but realistic. 
 CRITICAL FORMATTING RULES:
-1. Do NOT use any Markdown formatting (no ###, no **, no bullet points)
-2. Do NOT add extra blank lines between paragraphs
-3. Keep the EXACT same paragraph structure as the original
-4. Start directly with the news content (e.g., "(CNN)..." or similar)
-5. Output ONLY the rewritten fake news article, nothing else
+1. Output in this EXACT format:
+   Title: [Your rewritten title here]
+   Body: [Your rewritten article here]
+2. Do NOT use Markdown formatting in the body (no ###, no **, no bullet points)
+3. Keep the same paragraph structure as the original in the Body section
+4. The Title should be a single line
+5. The Body should start on a new line after "Body:"
         """.strip()
 
         return system_prompt, user_prompt
@@ -280,8 +282,8 @@ class LocalEngine:
                 "Your goal: rewrite the news to introduce subtle factual errors while EVADING detection. "
                 "KEY STRATEGY: The detector flagged specific words and patterns. You MUST avoid these tells. "
                 "Write in a neutral, professional journalistic tone. Avoid sensationalism. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "CRITICAL FORMAT: You MUST output in 'Title:' and 'Body:' format. "
+                "The Title should be a single line. The Body should follow on a new line after 'Body:'."
             )
         else:
             system_prompt = (
@@ -289,8 +291,8 @@ class LocalEngine:
                 "to introduce believable factual errors or alter key entities (names, locations, events) "
                 "while maintaining the EXACT same journalistic tone and formatting style as the original. "
                 "The goal is to create a piece of 'Fake News' that is plausible enough to fool fact-checkers. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "CRITICAL FORMAT: You MUST output in 'Title:' and 'Body:' format. "
+                "The Title should be a single line. The Body should follow on a new line after 'Body:'."
             )
 
         feedback_section = ""
@@ -321,11 +323,13 @@ Original Real News:
 Task:
 Rewrite the news above to be fake but realistic. 
 CRITICAL FORMATTING RULES:
-1. Do NOT use any Markdown formatting (no ###, no **, no bullet points)
-2. Do NOT add extra blank lines between paragraphs
-3. Keep the EXACT same paragraph structure as the original
-4. Start directly with the news content (e.g., "(CNN)..." or similar)
-5. Output ONLY the rewritten fake news article, nothing else
+1. Output in this EXACT format:
+   Title: [Your rewritten title here]
+   Body: [Your rewritten article here]
+2. Do NOT use Markdown formatting in the body (no ###, no **, no bullet points)
+3. Keep the same paragraph structure as the original in the Body section
+4. The Title should be a single line
+5. The Body should start on a new line after "Body:"
         """.strip()
 
         return system_prompt, user_prompt
