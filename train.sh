@@ -11,14 +11,19 @@ set -euo pipefail
 # --- Generator 模式設定 ---
 # 'api' = 使用 OpenAI API（推薦，不需 GPU）
 # 'local' = 使用本地模型（需要 GPU）
+# 'lora' = 使用 LoRA fine-tuned 模型（需要 GPU + 先訓練 LoRA）
 GEN_MODE="${GEN_MODE:-api}"
 
 # API 設定（GEN_MODE=api 時需要）
 # export OPENAI_API_KEY=sk-xxx  # 在執行前設定
 OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o-mini}"
 
-# 本地模型設定（GEN_MODE=local 時使用）
+# 本地模型設定（GEN_MODE=local 或 lora 時使用）
 GEN_MODEL="${GEN_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+
+# LoRA 設定（GEN_MODE=lora 時需要）
+LORA_PATH="${LORA_PATH:-}"  # LoRA checkpoint 路徑
+USE_4BIT="${USE_4BIT:-1}"   # 是否使用 4-bit 量化（1=是，0=否）
 
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-cnn_dailymail}"        # HF dataset id to load (e.g., cnn_dailymail)
@@ -56,6 +61,8 @@ cd "$(dirname "$0")"
 export GEN_MODE="$GEN_MODE"
 export OPENAI_MODEL="$OPENAI_MODEL"
 export GEN_MODEL="$GEN_MODEL"
+export LORA_PATH="$LORA_PATH"
+export USE_4BIT="$USE_4BIT"
 
 echo "============================================================"
 echo "VERBAL ADVERSARIAL FEEDBACK (VAF) TRAINING"
@@ -68,6 +75,10 @@ if [[ "$GEN_MODE" == "api" ]]; then
         echo "  Run: export OPENAI_API_KEY=sk-xxx"
         exit 1
     fi
+elif [[ "$GEN_MODE" == "lora" ]]; then
+    echo "  Base Model:  $GEN_MODEL"
+    echo "  LoRA Path:   ${LORA_PATH:-Not set (will train from scratch)}"
+    echo "  4-bit Quant: $USE_4BIT"
 else
     echo "  Local Model: $GEN_MODEL"
 fi
