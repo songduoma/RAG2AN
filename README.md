@@ -2,57 +2,85 @@
 
 > Research use only. This code is for fake-news detection and adversarial generation research. Do not use it to spread misinformation.
 
-RAG²AN ties a generator with retrieval-augmented generation (RAG) and an encoder-based discriminator into a simple GAN-style loop. The generator crafts suspect news with external context; the discriminator judges plausibility and surfaces suspicious words for feedback, iteratively improving the discriminator.
-
-## Project Structure
-- `gan_training.py`: Main training loop for loading data, calling the generator, training the discriminator, and saving checkpoints.
-- `train.sh`: Convenience launcher; tweak environment variables to change dataset, rounds, and models.
-- `generator.py`: Default generator is `Qwen/Qwen2.5-7B-Instruct`, with built-in Wikipedia RAG and feedback prompt support.
-- `discriminator.py`: Encoder-based discriminator (DeBERTa) that can return suspicious words via attention.
-- `search.py`: Google Search RAG via SerpAPI.
+RAG²AN couples a retrieval-augmented generator and a DeBERTa-style discriminator into a GAN-like loop. The latest code adds **Verbal Adversarial Feedback (VAF)**: the discriminator surfaces suspicious tokens plus structured reasons and suggestions; the generator adapts with that feedback and optional LoRA mini-SFT between rounds. Training can run with a local HF model or an OpenAI-compatible API model.
 
 ## Requirements & Install
-- Python 3.10 with CUDA 12.1 GPU.
-- HF token: Accept Qwen 7B terms on Hugging Face and set `HF_TOKEN`.
-- Google RAG: set `SERPAPI_API_KEY` (package `google-search-results` is included).
+- Python 3.10+, CUDA 12.1 GPU for local mode (`GEN_MODE=local`). API mode (`GEN_MODE=api`) needs no GPU.
+- Hugging Face access if your chosen HF model is gated (export `HF_TOKEN`).
+- Google RAG requires `SERPAPI_API_KEY`.
+- OpenAI-compatible generation requires `OPENAI_API_KEY` (and optionally `OPENAI_BASE_URL`).
 
 Install:
 ```bash
 cd RAG2AN
 # activate your venv/conda env first if needed
-pip install -r requirements.txt   # includes PyTorch cu121 extra-index
+pip install -r requirements.txt   # includes torch/vision/audio cu121 wheels
 ```
-> If you are not on CUDA 12.1, change the `--extra-index-url` at the top of `requirements.txt` or install torch/torchvision/torchaudio that match your CUDA.
+> On non-CUDA-12.1 systems, edit the `--extra-index-url` or install torch/torchvision/torchaudio that match your CUDA/CPU.
 
 ## Quickstart
-Default run (CNN/DailyMail subset, Wiki RAG, 10 GAN rounds):
+- **Local (default)**: Qwen3 4B Instruct + LoRA, Wiki RAG, 20 rounds, CNN/DailyMail slice.
+  ```bash
+  ./train.sh
+  ```
+  Defaults in `train.sh`: `DATASET_NAME=cnn_dailymail`, `DATASET_CONFIG=3.0.0`, `DATASET_SPLIT=train[:2000]`, `NUM_ROUNDS=20`, `GEN_MODEL=Qwen/Qwen3-4B-Instruct-2507`, `GEN_MODE=local`.
+
+- **API mode (no GPU)**:
+  ```bash
+  GEN_MODE=api \
+  OPENAI_API_KEY=sk-xxx \
+  DATASET_SPLIT=train[:100] \
+  NUM_ROUNDS=3 \
+  OUTPUT_DIR=local/runs/api_demo_$(date +%Y%m%d_%H%M%S) \
+  ./train.sh
+  ```
+
+- **Minimal local run** (faster smoke test, smaller batches):
+  ```bash
+  NUM_ROUNDS=2 \
+  DATASET_SPLIT=train[:64] \
+  DISC_EPOCHS=1 \
+  BATCH_SIZE=2 \
+  GEN_SFT_EVERY_ROUND=0 \
+  OUTPUT_DIR=local/runs/quick_$(date +%H%M%S) \
+  ./train.sh
+  ```
+
+`train.sh` is a thin wrapper over `gan_training.py`; you can also call it directly, e.g.:
 ```bash
-cd RAG2AN
-./train.sh
+python -u gan_training.py \
+  --dataset-name sanxing/advfake_news_please \
+  --dataset-split train \
+  --num-rounds 2 \
+  --rag-source wiki \
+  --generator-model Qwen/Qwen3-4B-Instruct-2507 \
+  --output-dir local/runs/manual_call
 ```
 
-Customize via env vars (example: fewer rounds, custom output path, enable disc RAG):
-```bash
-DATASET_NAME=cnn_dailymail \
-DATASET_CONFIG=3.0.0 \
-DATASET_SPLIT=train[:64] \
-NUM_ROUNDS=3 \
-DISC_EPOCHS=1 \
-BATCH_SIZE=4 \
-RAG_SOURCE=wiki \      # options: wiki | google | none
-DISC_USE_RAG=1 \
-GEN_USE_WIKI=1 \
-OUTPUT_DIR=local/runs/demo_$(date +%Y%m%d_%H%M%S) \
-./train.sh
+## Key knobs (env vars consumed by `train.sh`)
+- **Generator**: `GEN_MODE` (`local`|`api`), `GEN_MODEL` (HF id for local), `OPENAI_MODEL` (API id), `GEN_USE_LORA` (1/0), `GEN_SFT_EVERY_ROUND`, `GEN_SFT_LR`, `GEN_SFT_STEPS`, `GEN_SFT_BATCH_SIZE`, `GEN_SFT_MAX_LENGTH`, `GEN_SFT_SUCCESS_THRESHOLD`, `GEN_SFT_MAX_SAMPLES`, `GEN_SFT_WARMUP_ROUNDS`, `GEN_LORA_R`, `GEN_LORA_ALPHA`, `GEN_LORA_DROPOUT`.
+- **Data**: `DATASET_NAME`, `DATASET_CONFIG`, `DATASET_SPLIT` (Hugging Face slice), `REAL_SAMPLES_PER_ROUND` (defaults to 50 in the wrapper).
+- **Discriminator**: `DISC_MODEL`, `DISC_EPOCHS`, `BATCH_SIZE`, `LR`, `MAX_LENGTH`, `LABEL_SMOOTHING`.
+- **RAG & balance**: `RAG_SOURCE` (`wiki`|`google`|`none`), `DISC_USE_RAG` (1/0), `GEN_USE_WIKI` (1/0 fallback), `NUM_RAG_RESULTS`, `RAG_LANG`, `MIN_FOOL_RATE` / `MAX_SKIP_ROUNDS` (dynamic pause of D when G is weak).
+- **Output/logging**: `OUTPUT_DIR`, `LOG_INTERVAL`.
+
+## Outputs
+When `--output-dir` / `OUTPUT_DIR` is set:
+```
+output_dir/
+  training_history.json   # per-round stats (mean P(real), fool rate, loss, etc.)
+  round_1/                # HF dataset with fake samples + feedback metadata
+  round_2/
+  ...
+  disc_round_1/           # discriminator checkpoints (per round)
+  disc_best/              # best-loss discriminator
 ```
 
-## Generator Demo & API
-`generator.py` now ships with a simple demo that loads the first five records from `cnn_dailymail` (`test[:5]`), gathers Wikipedia snippets for each prompt, and feeds them into the `Qwen/Qwen2.5-7B-Instruct` pipeline. Running `python generator.py` prints a comparison report that labels the entire original article as **REAL NEWS (Full Text)** followed by the **GENERATED FAKE NEWS** version, making it easy to review how the GAN-textifier alters the source.
+## Generator demo & API
+- Mode is controlled by `GEN_MODE` (`local` uses HF weights + optional LoRA; `api` uses OpenAI-compatible chat completions).
+- Run `python generator.py` to see a small two-step demo (with and without feedback). It will auto-pull Wikipedia snippets unless `use_rag=False`.
 
-Behind the scenes, the demo uses `search_wikipedia` → `LlamaEngine` → `generate_fake_news` so that every fake article keeps the original paragraph layout, avoids markdown, and begins directly with the news content (e.g., “(CNN)...”).
-
-### Programmatic usage
-Import `FakeNewsGenerator` or call the exported helper `generator()` to reuse the pipeline in other scripts. Example:
+Programmatic helper:
 ```python
 from generator import generator
 
@@ -63,51 +91,19 @@ fake = generator(
     use_rag=True,
     rag_query="Technology companies in Antarctica",
     lang="en",
-    num_rag_results=3
+    num_rag_results=3,
 )
 print(fake)
 ```
+Pass `model_id=` if you want to override the HF model in local mode.
 
-Key arguments:
-- `feedback_prompt`: textual guidance to steer the generator away from obviously fake phrasing.
-- `use_rag` / `rag_query` / `context_override`: controls whether and how Wikipedia context is pulled; `context_override` bypasses the lookup.
-- `lang`, `num_rag_results`: configure the wiki locale and number of snippets per query.
-- `model_id`: override the default `MODEL_ID` (`Qwen/Qwen2.5-7B-Instruct`) if you want a smaller or licensed model.
-
-The helper lazily instantiates `FakeNewsGenerator`, which wraps `LlamaEngine` and the `search_wikipedia` retrieval logic. When the wiki endpoint fails, `search_wikipedia` returns a lightweight fallback snippet so the demo keeps running.
-
-`train.sh` calls `gan_training.py`. Key arguments:
-- `--dataset-name` / `--dataset-config` / `--dataset-split`: HF dataset settings. Default in code is `sanxing/advfake_news_please`; `train.sh` defaults to `cnn_dailymail 3.0.0 train`.
-- `--max-samples`: limit sample count for quick runs.
-- `--num-rounds`: GAN rounds (generate fakes + train discriminator).
-- `--rag-source`: `wiki` | `google` | `none` to choose context source.
-- `--disc-use-rag` / `--generator-use-wiki` / `--filter-no-wiki`: whether discriminator gets RAG context, whether generator can fall back to wiki, and whether to skip samples with empty wiki hits.
-- `--generator-model` / `--discriminator-model`: HF model IDs.
-- `--output-dir`: where generated samples and discriminator checkpoints are written.
-
-## Outputs
-When `--output-dir` is set:
-```
-output_dir/
-  round_1/                # HF Dataset with generated samples (text, label, prob_true, suspicious_words, feedback_prompt)
-    state.json            # per-round stats produced by `gan_training.py` (avg loss, sample counts, etc.)
-  round_2/
-  ...
-  disc_round_1/           # per-round discriminator checkpoints (transformers format)
-  disc_best/              # best-loss discriminator
-```
-
-
-## Pipeline Overview
-1) Load data (`load_dataset` or `load_from_disk`) with fields `title` / `description` or `text`. CNN/DailyMail auto-derives `title` and date.
-2) Fetch context by `rag_source`: Wikipedia (default), SerpAPI Google, or none.
-3) Generator produces fake news, keeping only `Title/Body` for the discriminator to avoid feeding prompts.
-4) Discriminator returns plausibility and suspicious words; feedback is stored for the next round.
-5) Mix real/fake samples, train discriminator, and save stats/checkpoints.
+## Pipeline overview
+- Data: loads HF datasets (`load_dataset` or `load_from_disk`). For `cnn_dailymail`, the longer half of articles is dropped for speed; titles derive from highlights.
+- RAG: `RAG_SOURCE=wiki` (default) hits Wikipedia; `google` uses SerpAPI; `none` skips retrieval. `GEN_USE_WIKI=1` lets the generator fall back to wiki when the context is empty.
+- Generation: rewrites real news to fake, enforces “no markdown, keep paragraph structure”. Feedback from prior rounds is injected into the prompt. In local mode, LoRA adapters can be fine-tuned briefly each round on successful fakes.
+- Discrimination: DeBERTa classifier returns P(real), suspicious words, detection reasons, and improvement suggestions. Label smoothing plus dynamic skip logic prevent the discriminator from overpowering the generator.
 
 ## Notes
-- VRAM/compute depends on generator size; swap `generator_model` to a smaller HF model (e.g., `gpt2`) if resources are tight.
-- Requirements default to PyTorch 2.5.1 + cu121 with `safetensors` to avoid older `torch.load` restrictions. Adjust wheels if you use a different CUDA.
-- Wikipedia API needs network access; if blocked, `generator.py` falls back to stub text.
-- Respect SerpAPI terms when using Google RAG; do not misuse real search results.
+- VRAM depends on the local generator; swap `GEN_MODEL` to a smaller HF model if resources are tight. API mode avoids GPU needs but costs tokens.
+- Wikipedia API and SerpAPI require network access; if blocked, wiki retrieval falls back to stub text.
 - Research/defense use only; do not deploy for real misinformation.

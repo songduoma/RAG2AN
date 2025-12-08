@@ -37,7 +37,7 @@ GEN_LORA_DROPOUT="${GEN_LORA_DROPOUT:-0.05}"
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-cnn_dailymail}"        # HF dataset id to load (e.g., cnn_dailymail)
 DATASET_CONFIG="${DATASET_CONFIG:-3.0.0}"            # optional dataset config/version
-DATASET_SPLIT="${DATASET_SPLIT:-train[:2000]}"         # HF split selector (smaller for API cost)
+DATASET_SPLIT="${DATASET_SPLIT:-train[:20000]}"         # HF split selector (smaller for API cost)
 NUM_ROUNDS="${NUM_ROUNDS:-20}"                        # GAN rounds (generate + train disc)
 
 # --- 訓練設定 ---
@@ -57,11 +57,11 @@ RAG_LANG="${RAG_LANG:-en}"                           # wiki language for RAG
 # --- 動態平衡設定（防止 D 壓制 G）---
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"            # Label smoothing (讓 D 學慢一點)
 MIN_FOOL_RATE="${MIN_FOOL_RATE:-0.05}"               # G 低於此 fool rate 時暫停訓練 D
-MAX_SKIP_ROUNDS="${MAX_SKIP_ROUNDS:-2}"              # 最多連續跳過幾輪 D 訓練
+MAX_SKIP_ROUNDS="${MAX_SKIP_ROUNDS:-3}"              # 最多連續跳過幾輪 D 訓練
 
 # --- 模型設定 ---
 DISC_MODEL="${DISC_MODEL:-microsoft/deberta-v3-base}" # discriminator model id
-REAL_SAMPLES_PER_ROUND="${REAL_SAMPLES_PER_ROUND:-50}"
+REAL_SAMPLES_PER_ROUND="${REAL_SAMPLES_PER_ROUND:-500}"
 
 # --- 輸出設定 ---
 OUTPUT_DIR="${OUTPUT_DIR:-local/rag_gan_runs/$(date +%Y%m%d_%H%M%S)}"
