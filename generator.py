@@ -12,16 +12,21 @@ RAG²AN Generator - 支援 API 和本地模型兩種模式
         # 會自動載入 Qwen/Qwen2.5-7B-Instruct
 """
 
+import copy
 import os
 import requests
-from typing import Optional
+from typing import Dict, Optional, Union
 
 # ==========================================
 # 1. 配置設定 (Configuration)
 # ==========================================
 
 # 模式選擇：'api' 或 'local'
-GEN_MODE = os.environ.get("GEN_MODE", "api")
+GEN_MODE = os.environ.get("GEN_MODE", "local")
+GEN_USE_LORA = os.environ.get("GEN_USE_LORA", "true").lower() in ("true", "1", "yes")
+GEN_LORA_R = int(os.environ.get("GEN_LORA_R", "8"))
+GEN_LORA_ALPHA = int(os.environ.get("GEN_LORA_ALPHA", "16"))
+GEN_LORA_DROPOUT = float(os.environ.get("GEN_LORA_DROPOUT", "0.05"))
 
 # API 設定（OpenAI 相容）
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -29,7 +34,7 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 # 本地模型設定
-LOCAL_MODEL_ID = os.environ.get("GEN_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+LOCAL_MODEL_ID = os.environ.get("GEN_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 
 # 為了向後相容，保留 MODEL_ID
 MODEL_ID = LOCAL_MODEL_ID
@@ -193,8 +198,12 @@ CRITICAL FORMATTING RULES:
         return system_prompt, user_prompt
 
     def generate_fake_news(
-        self, real_news: dict, context: str, feedback_prompt: str = None
-    ) -> str:
+        self,
+        real_news: dict,
+        context: str,
+        feedback_prompt: str = None,
+        train_mode: bool = False,
+    ) -> Union[str, Dict[str, object]]:
         """呼叫 API 生成假新聞"""
         system_prompt, user_prompt = self._build_prompts(
             real_news, context, feedback_prompt
@@ -226,8 +235,15 @@ CRITICAL FORMATTING RULES:
             response.raise_for_status()
 
             data = response.json()
-            generated_text = data["choices"][0]["message"]["content"]
-            return generated_text.strip()
+            generated_text = data["choices"][0]["message"]["content"].strip()
+            if not train_mode:
+                return generated_text
+            return {
+                "text": generated_text,
+                "prompt": "",
+                "prompt_ids": None,
+                "generated_ids": None,
+            }
 
         except requests.exceptions.RequestException as e:
             print(f"[API Error] {e}")
@@ -247,25 +263,48 @@ class LocalEngine:
     def __init__(self, model_id: str = None):
         # 延遲導入，只有需要時才載入 torch
         import torch
-        from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         model_id = model_id or LOCAL_MODEL_ID
         print(f"[Local Engine] Loading model: {model_id} (fp16)")
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float16, device_map="auto"
-        )
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self.pipe = pipeline(
-            "text-generation",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_new_tokens=1024,
-            temperature=0.7,
-            top_p=0.9,
-            return_full_text=False,
-        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float16 if self.device.type == "cuda" else None
+        ).to(self.device)
+
+        self.use_lora = GEN_USE_LORA
+        if self.use_lora:
+            lora_cfg = LoraConfig(
+                r=GEN_LORA_R,
+                lora_alpha=GEN_LORA_ALPHA,
+                lora_dropout=GEN_LORA_DROPOUT,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.model = get_peft_model(base_model, lora_cfg)
+            # 便於下游日誌顯示
+            setattr(self.model, "lora_r", GEN_LORA_R)
+            setattr(self.model, "lora_alpha", GEN_LORA_ALPHA)
+            setattr(self.model, "lora_dropout", GEN_LORA_DROPOUT)
+            self.base_model = copy.deepcopy(base_model).eval()
+            for p in self.base_model.parameters():
+                p.requires_grad_(False)
+            print(
+                f"[Local Engine] LoRA enabled (r={GEN_LORA_R}, alpha={GEN_LORA_ALPHA}, dropout={GEN_LORA_DROPOUT})"
+            )
+            if hasattr(self.model, "print_trainable_parameters"):
+                self.model.print_trainable_parameters()
+        else:
+            self.model = base_model
+            self.base_model = None
+
+        self.model.eval()
 
     def _build_prompts(
         self, real_news: dict, context: str, feedback_prompt: str = None
@@ -331,9 +370,15 @@ CRITICAL FORMATTING RULES:
         return system_prompt, user_prompt
 
     def generate_fake_news(
-        self, real_news: dict, context: str, feedback_prompt: str = None
-    ) -> str:
-        """使用本地模型生成假新聞"""
+        self,
+        real_news: dict,
+        context: str,
+        feedback_prompt: str = None,
+        train_mode: bool = False,
+    ) -> Union[str, Dict[str, object]]:
+        """使用本地模型生成假新聞；train_mode 時會回傳 token 資訊"""
+        import torch
+
         system_prompt, user_prompt = self._build_prompts(
             real_news, context, feedback_prompt
         )
@@ -346,22 +391,39 @@ CRITICAL FORMATTING RULES:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        outputs = self.pipe(prompt)
-        generated_text = outputs[0].get("generated_text", "")
+        enc = self.tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=False
+        ).to(self.device)
 
-        # 清理輸出
-        if (
-            isinstance(generated_text, str)
-            and prompt
-            and generated_text.startswith(prompt)
-        ):
-            generated_text = generated_text[len(prompt) :]
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            generated = self.model.generate(
+                **enc,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        if was_training:
+            self.model.train()
 
-        split_tok = "<|start_header_id|>assistant<|end_header_id|>"
-        if split_tok in generated_text:
-            generated_text = generated_text.split(split_tok)[-1].strip()
+        prompt_len = enc["input_ids"].shape[1]
+        generated_ids = generated[0][prompt_len:]
+        generated_text = self.tokenizer.decode(
+            generated_ids, skip_special_tokens=True
+        ).strip()
 
-        return generated_text
+        if not train_mode:
+            return generated_text
+
+        return {
+            "text": generated_text,
+            "prompt": prompt,
+            "prompt_ids": enc["input_ids"][0].detach().cpu(),
+            "generated_ids": generated_ids.detach().cpu(),
+        }
 
 
 # ==========================================
@@ -389,6 +451,16 @@ class FakeNewsGenerator:
 
         print(f"[FakeNewsGenerator] Initialized in '{self.mode}' mode")
 
+    def get_trainable_components(self):
+        """Return (model, tokenizer, base_model) for local training."""
+        if self.mode != "local":
+            raise ValueError("Trainable components only available in local mode.")
+        return (
+            self.engine.model,
+            self.engine.tokenizer,
+            getattr(self.engine, "base_model", None),
+        )
+
     def generate(
         self,
         title: str,
@@ -399,7 +471,8 @@ class FakeNewsGenerator:
         rag_query: str = None,
         num_rag_results: int = 3,
         lang: str = "en",
-    ) -> str:
+        train_mode: bool = False,
+    ) -> Union[str, Dict[str, object]]:
         """生成假新聞"""
         real_news = {"title": title, "text": content}
 
@@ -412,7 +485,7 @@ class FakeNewsGenerator:
             )
 
         fake_news = self.engine.generate_fake_news(
-            real_news, rag_context, feedback_prompt
+            real_news, rag_context, feedback_prompt, train_mode=train_mode
         )
         return fake_news
 
@@ -434,7 +507,7 @@ def generator(
     lang: str = "en",
     context_override: str = None,
     model_id: str = None,
-) -> str:
+) -> Union[str, Dict[str, object]]:
     """便捷函數，自動管理全局 generator 實例"""
     global _global_generator
     if _global_generator is None:
@@ -449,6 +522,7 @@ def generator(
         rag_query,
         num_rag_results,
         lang,
+        train_mode=False,
     )
 
 

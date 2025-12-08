@@ -1,6 +1,8 @@
 import argparse
 import datetime
 import math
+import os
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -112,6 +114,35 @@ class GANTrainer:
         self.optimizer = torch.optim.AdamW(
             self.discriminator.model.parameters(), lr=args.lr
         )
+        self.gen_sft_enabled = (
+            getattr(args, "gen_sft_every_round", False)
+            and GEN_MODE == "local"
+        )
+        self.gen_use_lora = getattr(
+            getattr(self.generator, "engine", None), "use_lora", False
+        )
+        self.gen_model = None
+        self.gen_tokenizer = None
+        self.gen_base_model = None
+        self.gen_optimizer = None
+        self.gen_lambda_kl = getattr(args, "gen_sft_lambda_kl", 0.01)
+        self.gen_max_grad_norm = getattr(args, "gen_sft_max_grad_norm", 1.0)
+        self.gen_sft_steps = getattr(args, "gen_sft_steps", 2)
+        self.gen_sft_batch_size = getattr(args, "gen_sft_batch_size", 1)
+        self.gen_sft_max_length = getattr(args, "gen_sft_max_length", 512)
+        self.gen_success_threshold = getattr(args, "gen_sft_success_threshold", 0.55)
+        self.gen_sft_max_samples = getattr(args, "gen_sft_max_samples", 2)
+        self.gen_sft_warmup_rounds = getattr(args, "gen_sft_warmup_rounds", 3)
+        if self.gen_sft_enabled and self.gen_use_lora:
+            (
+                self.gen_model,
+                self.gen_tokenizer,
+                self.gen_base_model,
+            ) = self.generator.get_trainable_components()
+            if self.gen_base_model is not None:
+                self.gen_base_model.to(next(self.gen_model.parameters()).device)
+            params = [p for p in self.gen_model.parameters() if p.requires_grad]
+            self.gen_optimizer = torch.optim.AdamW(params, lr=args.gen_sft_lr)
         self.best_loss = float("inf")
         self.best_path = None
         if not dataset:
@@ -215,11 +246,111 @@ class GANTrainer:
 
         return epoch_loss / max(step, 1)
 
+    def train_generator_sft(
+        self,
+        success_records: List[Dict[str, Any]],
+        all_fake_samples: List[Dict[str, Any]],
+        round_id: int,
+    ) -> None:
+        """
+        Mini SFT on high-score fake samples using LoRA-adapted generator.
+        """
+        if (
+            not self.gen_sft_enabled
+            or not self.gen_use_lora
+            or self.gen_model is None
+        ):
+            return
+
+        device = next(self.gen_model.parameters()).device
+        records = [
+            r
+            for r in success_records
+            if r.get("fool")
+            and r.get("prob_true", 0.0) >= self.gen_success_threshold
+        ]
+
+        warmup_used = False
+        if not records and round_id <= self.gen_sft_warmup_rounds:
+            warmup_used = True
+            candidates = [
+                f for f in all_fake_samples if f.get("label", 1) == 0
+            ]
+            candidates = sorted(
+                candidates, key=lambda x: x.get("prob_true", 0.0), reverse=True
+            )
+            records = candidates[: self.gen_sft_max_samples]
+
+        if not records:
+            return
+
+        samples = sorted(records, key=lambda x: x["prob_true"], reverse=True)[
+            : self.gen_sft_max_samples
+        ]
+
+        r_val = None
+        peft_cfg = getattr(self.gen_model, "peft_config", {})
+        if isinstance(peft_cfg, dict) and peft_cfg:
+            first_cfg = next(iter(peft_cfg.values()))
+            r_val = getattr(first_cfg, "r", None)
+        if r_val is None:
+            r_val = getattr(self.gen_model, "lora_r", "n/a")
+
+        print(
+            f"    [LoRA SFT] Starting mini fine-tune on {len(samples)} samples "
+            f"(r={r_val}, "
+            f"warmup={'yes' if warmup_used else 'no'})"
+        )
+        self.gen_model.train()
+        for step in range(self.gen_sft_steps):
+            batch = random.sample(
+                samples, k=min(self.gen_sft_batch_size, len(samples))
+            )
+            texts = []
+            for rec in batch:
+                prompt_text = rec.get("prompt_text", "")
+                fake_news = rec.get("fake_news_text", "")
+                combined = f"{prompt_text}\n{fake_news}".strip()
+                texts.append(combined)
+
+            enc = self.gen_tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.gen_sft_max_length,
+            ).to(device)
+
+            outputs = self.gen_model(**enc, labels=enc["input_ids"])
+            ce_loss = outputs.loss
+
+            # KL regularization against frozen base model to avoid drift
+            kl_loss = 0.0
+            if self.gen_base_model is not None:
+                with torch.no_grad():
+                    base_outputs = self.gen_base_model(**enc)
+                kl_loss = torch.nn.functional.kl_div(
+                    torch.nn.functional.log_softmax(outputs.logits, dim=-1),
+                    torch.nn.functional.softmax(base_outputs.logits, dim=-1),
+                    reduction="batchmean",
+                )
+
+            total_loss = ce_loss + self.gen_lambda_kl * kl_loss
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.gen_model.parameters(), self.gen_max_grad_norm
+            )
+            if self.gen_optimizer is not None:
+                self.gen_optimizer.step()
+                self.gen_optimizer.zero_grad(set_to_none=True)
+        self.gen_model.eval()
     def run_round(self, round_id: int) -> Dict[str, Any]:
         print(f"\n===== Round {round_id} =====")
         real_dataset = self._get_real_samples_for_round(round_id)
         real_samples: List[Dict[str, Any]] = []
         fake_samples: List[Dict[str, Any]] = []
+        successful_records: List[Dict[str, Any]] = []
+        collect_train_signals = self.gen_sft_enabled and self.gen_use_lora
 
         for idx, example in enumerate(real_dataset, start=1):
             # Compose discriminator input for the real article.
@@ -248,7 +379,7 @@ class GANTrainer:
             )
 
             feedback = example.get("feedback_prompt")
-            fake = self.generator.generate(
+            gen_output = self.generator.generate(
                 title=example.get("title", ""),
                 content=example.get("description", ""),
                 feedback_prompt=feedback,
@@ -257,7 +388,19 @@ class GANTrainer:
                 rag_query=example.get("title", ""),
                 num_rag_results=self.args.num_rag_results,
                 lang=self.args.rag_lang,
+                train_mode=collect_train_signals,
             )
+
+            if isinstance(gen_output, dict):
+                fake = gen_output.get("text", "")
+                prompt_text = gen_output.get("prompt", "")
+                prompt_ids = gen_output.get("prompt_ids")
+                generated_ids = gen_output.get("generated_ids")
+            else:
+                fake = gen_output
+                prompt_text = ""
+                prompt_ids = None
+                generated_ids = None
 
             # 只保留生成的文章內容（Title/Body），避免把 prompt/指令餵給判別器
             gen_title, gen_body = extract_article(fake)
@@ -345,6 +488,10 @@ class GANTrainer:
                     "detection_reasons": detailed["detection_reasons"],
                     "feedback_prompt": example["feedback_prompt"],
                     "generated_content": clean_generated,  # 保存生成內容，用於 few-shot
+                    "prompt_text": prompt_text,
+                    "prompt_ids": prompt_ids,
+                    "generated_ids": generated_ids,
+                    "fool": fake_prob_true > detailed["prob_fake"],
                 }
             )
 
@@ -354,11 +501,17 @@ class GANTrainer:
 
         # === 新增：先計算 fool_rate，收集成功案例 ===
         prob_trues = [s["prob_true"] for s in fake_samples]
-        fooled_count = sum(1 for p in prob_trues if p > 0.5)
-        fool_rate = fooled_count / max(len(prob_trues), 1)
+        fooled_count = sum(1 for s in fake_samples if s.get("fool"))
+        fool_rate = fooled_count / max(len(fake_samples), 1)
 
-        # 收集成功騙過 D 的案例（prob_true > 0.5）
-        new_successes = [s for s in fake_samples if s["prob_true"] > 0.5]
+        # 收集成功騙過 D 的案例（需為假新聞且 fooled）
+        new_successes = [
+            s
+            for s in fake_samples
+            if s.get("label", 1) == 0
+            and s.get("fool")
+            and s.get("prob_true", 0.0) > self.gen_success_threshold
+        ]
         if new_successes:
             # 按 prob_true 排序，取最好的
             new_successes.sort(key=lambda x: x["prob_true"], reverse=True)
@@ -367,6 +520,16 @@ class GANTrainer:
                     {
                         "text": s.get("generated_content", s["text"][:500]),
                         "prob_true": s["prob_true"],
+                    }
+                )
+                successful_records.append(
+                    {
+                        "prompt_text": s.get("prompt_text", ""),
+                        "fake_news_text": s.get("generated_content", ""),
+                        "prob_true": s["prob_true"],
+                        "prompt_ids": s.get("prompt_ids"),
+                        "generated_ids": s.get("generated_ids"),
+                        "fool": s.get("fool", True),
                     }
                 )
             # 只保留最近 5 個成功案例
@@ -424,6 +587,11 @@ class GANTrainer:
                 avg_loss = self._train_discriminator(
                     mixed_samples, use_label_smoothing=True
                 )
+
+        if successful_records or (
+            self.gen_sft_enabled and round_id <= self.gen_sft_warmup_rounds
+        ):
+            self.train_generator_sft(successful_records, fake_samples, round_id)
 
         self.last_fool_rate = fool_rate
 
@@ -632,6 +800,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generator-model", type=str, default=MODEL_ID)
     parser.add_argument(
         "--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL
+    )
+    parser.add_argument(
+        "--gen-sft-every-round",
+        action="store_true",
+        default=os.environ.get("GEN_SFT_EVERY_ROUND", "0").lower()
+        in ("1", "true", "yes"),
+        help="Run a small SFT step on the generator after each round (LoRA only, local mode).",
+    )
+    parser.add_argument(
+        "--no-gen-sft",
+        dest="gen_sft_every_round",
+        action="store_false",
+        help="Disable generator SFT regardless of env flag.",
+    )
+    parser.add_argument(
+        "--gen-sft-lr",
+        type=float,
+        default=5e-5,
+        help="Learning rate for generator mini SFT (LoRA params).",
+    )
+    parser.add_argument(
+        "--gen-sft-steps",
+        type=int,
+        default=2,
+        help="Gradient steps per round for mini SFT.",
+    )
+    parser.add_argument(
+        "--gen-sft-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for mini SFT samples.",
+    )
+    parser.add_argument(
+        "--gen-sft-max-length",
+        type=int,
+        default=512,
+        help="Max sequence length for generator SFT inputs.",
+    )
+    parser.add_argument(
+        "--gen-sft-success-threshold",
+        type=float,
+        default=0.55,
+        help="Minimum discriminator P(real) to treat a fake as successful.",
+    )
+    parser.add_argument(
+        "--gen-sft-max-samples",
+        type=int,
+        default=2,
+        help="Number of top successful samples to SFT on each round.",
+    )
+    parser.add_argument(
+        "--gen-sft-lambda-kl",
+        type=float,
+        default=0.01,
+        help="KL penalty weight to keep LoRA close to base model.",
+    )
+    parser.add_argument(
+        "--gen-sft-max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm for generator SFT.",
+    )
+    parser.add_argument(
+        "--gen-sft-warmup-rounds",
+        type=int,
+        default=3,
+        help="Rounds to allow warm-up SFT when no successful fake samples exist.",
     )
     parser.add_argument(
         "--output-dir", type=str, help="Where to save generated fakes per round."
