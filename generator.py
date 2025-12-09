@@ -27,6 +27,7 @@ GEN_USE_LORA = os.environ.get("GEN_USE_LORA", "true").lower() in ("true", "1", "
 GEN_LORA_R = int(os.environ.get("GEN_LORA_R", "8"))
 GEN_LORA_ALPHA = int(os.environ.get("GEN_LORA_ALPHA", "16"))
 GEN_LORA_DROPOUT = float(os.environ.get("GEN_LORA_DROPOUT", "0.05"))
+GEN_MAX_NEW_TOKENS = int(os.environ.get("GEN_MAX_NEW_TOKENS", "512"))
 
 # API 設定（OpenAI 相容）
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -220,7 +221,7 @@ CRITICAL FORMATTING RULES:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": 1024,
+            "max_tokens": GEN_MAX_NEW_TOKENS,
             "temperature": 0.7,
             "top_p": 0.9,
         }
@@ -400,7 +401,7 @@ CRITICAL FORMATTING RULES:
         with torch.no_grad():
             generated = self.model.generate(
                 **enc,
-                max_new_tokens=1024,
+                max_new_tokens=GEN_MAX_NEW_TOKENS,
                 temperature=0.7,
                 top_p=0.9,
                 do_sample=True,

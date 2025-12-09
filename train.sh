@@ -8,6 +8,9 @@ set -euo pipefail
 # VERBAL ADVERSARIAL FEEDBACK (VAF) - Enhanced GAN Training
 # ============================================================
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF
+
 # --- Generator 模式設定 ---
 # 'api' = 使用 OpenAI API（推薦，不需 GPU）
 # 'local' = 使用本地模型（需要 GPU）
@@ -16,6 +19,7 @@ GEN_MODE="${GEN_MODE:-local}"
 # API 設定（GEN_MODE=api 時需要）
 # export OPENAI_API_KEY=sk-xxx  # 在執行前設定
 OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o-mini}"
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
 
 # 本地模型設定（GEN_MODE=local 時使用）
 GEN_MODEL="${GEN_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
@@ -24,28 +28,29 @@ GEN_SFT_EVERY_ROUND="${GEN_SFT_EVERY_ROUND:-1}"
 GEN_SFT_LR="${GEN_SFT_LR:-1e-4}"
 GEN_SFT_STEPS="${GEN_SFT_STEPS:-3}"
 GEN_SFT_BATCH_SIZE="${GEN_SFT_BATCH_SIZE:-1}"
-GEN_SFT_MAX_LENGTH="${GEN_SFT_MAX_LENGTH:-1024}"
+GEN_SFT_MAX_LENGTH="${GEN_SFT_MAX_LENGTH:-512}"
 GEN_SFT_KL_WEIGHT="${GEN_SFT_KL_WEIGHT:-0.01}"
-GEN_SFT_MAX_SAMPLES="${GEN_SFT_MAX_SAMPLES:-8}"
-GEN_SFT_SUCCESS_THRESHOLD="${GEN_SFT_SUCCESS_THRESHOLD:-0.53}"
+GEN_SFT_MAX_SAMPLES="${GEN_SFT_MAX_SAMPLES:-10}"
+GEN_SFT_SUCCESS_THRESHOLD="${GEN_SFT_SUCCESS_THRESHOLD:-0.5}"
 GEN_SFT_MAX_GRAD_NORM="${GEN_SFT_MAX_GRAD_NORM:-1.0}"
 GEN_SFT_WARMUP_ROUNDS="${GEN_SFT_WARMUP_ROUNDS:-10}"
-GEN_LORA_R="${GEN_LORA_R:-16}"
-GEN_LORA_ALPHA="${GEN_LORA_ALPHA:-32}"
+GEN_LORA_R="${GEN_LORA_R:-8}"
+GEN_LORA_ALPHA="${GEN_LORA_ALPHA:-16}"
 GEN_LORA_DROPOUT="${GEN_LORA_DROPOUT:-0.05}"
+GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-512}"
 
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-cnn_dailymail}"        # HF dataset id to load (e.g., cnn_dailymail)
 DATASET_CONFIG="${DATASET_CONFIG:-3.0.0}"            # optional dataset config/version
-DATASET_SPLIT="${DATASET_SPLIT:-train[:20000]}"         # HF split selector (smaller for API cost)
+DATASET_SPLIT="${DATASET_SPLIT:-train[:40000]}"         # HF split selector (smaller for API cost)
 NUM_ROUNDS="${NUM_ROUNDS:-20}"                        # GAN rounds (generate + train disc)
 
 # --- 訓練設定 ---
-LOG_INTERVAL="${LOG_INTERVAL:-5}"                    # print progress every N samples
+LOG_INTERVAL="${LOG_INTERVAL:-10}"                    # print progress every N samples
 DISC_EPOCHS="${DISC_EPOCHS:-1}"                      # epochs per round for discriminator
 BATCH_SIZE="${BATCH_SIZE:-2}"                        # discriminator batch size
-LR="${LR:-2e-5}"                                     # discriminator learning rate
-MAX_LENGTH="${MAX_LENGTH:-1024}"
+LR="${LR:-1e-5}"                                     # discriminator learning rate
+MAX_LENGTH="${MAX_LENGTH:-512}"
 
 # --- RAG 設定 ---
 RAG_SOURCE="${RAG_SOURCE:-wiki}"                     # retrieval source: google | wiki | none
@@ -61,6 +66,8 @@ MAX_SKIP_ROUNDS="${MAX_SKIP_ROUNDS:-3}"              # 最多連續跳過幾輪 
 
 # --- 模型設定 ---
 DISC_MODEL="${DISC_MODEL:-microsoft/deberta-v3-base}" # discriminator model id
+ENCODER_DISCRIMINATOR_MODEL="${ENCODER_DISCRIMINATOR_MODEL:-$DISC_MODEL}"
+ENCODER_DISCRIMINATOR_MAX_LEN="${ENCODER_DISCRIMINATOR_MAX_LEN:-$MAX_LENGTH}"
 REAL_SAMPLES_PER_ROUND="${REAL_SAMPLES_PER_ROUND:-500}"
 
 # --- 輸出設定 ---
@@ -71,12 +78,17 @@ cd "$(dirname "$0")"
 # 設定環境變數
 export GEN_MODE="$GEN_MODE"
 export OPENAI_MODEL="$OPENAI_MODEL"
+export OPENAI_BASE_URL="$OPENAI_BASE_URL"
+# OPENAI_API_KEY 只在 api 模式下需要，這裡不覆蓋使用者環境
 export GEN_MODEL="$GEN_MODEL"
 export GEN_USE_LORA="$GEN_USE_LORA"
 export GEN_SFT_EVERY_ROUND="$GEN_SFT_EVERY_ROUND"
 export GEN_LORA_R="$GEN_LORA_R"
 export GEN_LORA_ALPHA="$GEN_LORA_ALPHA"
 export GEN_LORA_DROPOUT="$GEN_LORA_DROPOUT"
+export GEN_MAX_NEW_TOKENS="$GEN_MAX_NEW_TOKENS"
+export ENCODER_DISCRIMINATOR_MODEL="$ENCODER_DISCRIMINATOR_MODEL"
+export ENCODER_DISCRIMINATOR_MAX_LEN="$ENCODER_DISCRIMINATOR_MAX_LEN"
 
 echo "============================================================"
 echo "VERBAL ADVERSARIAL FEEDBACK (VAF) TRAINING"

@@ -352,6 +352,14 @@ class GANTrainer:
         successful_records: List[Dict[str, Any]] = []
         collect_train_signals = self.gen_sft_enabled and self.gen_use_lora
 
+        def _truncate_text(text: str, limit: int = 800) -> str:
+            if not isinstance(text, str):
+                text = str(text)
+            return text if len(text) <= limit else text[:limit] + "... [truncated]"
+
+        first_real_ref: Optional[Dict[str, str]] = None
+        first_fake_ref: Optional[Dict[str, str]] = None
+
         for idx, example in enumerate(real_dataset, start=1):
             # Compose discriminator input for the real article.
             real_text = format_discriminator_input(
@@ -361,6 +369,15 @@ class GANTrainer:
                 source=self.args.rag_source,
             )
             real_samples.append({"text": real_text, "label": 1})
+            if first_real_ref is None:
+                first_real_ref = {
+                    "title": (example.get("title") or "").strip(),
+                    "article": (
+                        example.get("description")
+                        or example.get("article")
+                        or ""
+                    ).strip(),
+                }
 
             # Build retrieval context for the generator.
             rag_context = self._build_context(example)
@@ -405,6 +422,11 @@ class GANTrainer:
             # 只保留生成的文章內容（Title/Body），避免把 prompt/指令餵給判別器
             gen_title, gen_body = extract_article(fake)
             clean_generated = f"{gen_title}\n{gen_body}".strip()
+            if first_fake_ref is None:
+                first_fake_ref = {
+                    "title": gen_title.strip(),
+                    "body": gen_body.strip(),
+                }
 
             fake_disc_input = format_discriminator_input(
                 example,
@@ -638,6 +660,13 @@ class GANTrainer:
         }
 
         # 印出關鍵指標（方便觀察 G vs D 動態）
+        if first_real_ref and first_fake_ref:
+            print("  ┌─ Sample Inspection (first item of round)")
+            print(f"  │ [REAL] Title: {first_real_ref['title']}")
+            print(f"  │ [REAL] Article: {_truncate_text(first_real_ref['article'])}")
+            print(f"  │ [FAKE] Title: {first_fake_ref['title']}")
+            print(f"  │ [FAKE] Article: {_truncate_text(first_fake_ref['body'])}")
+            print("  └─ End Sample Inspection\n")
         print(f"\n  ┌─────────────────────────────────────────────────────")
         print(f"  │ ROUND {round_id} SUMMARY - Verbal Adversarial Feedback")
         print(f"  ├─────────────────────────────────────────────────────")
@@ -710,7 +739,7 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
             load_kwargs["name"] = args.dataset_config
         ds = load_dataset(args.dataset_name, **load_kwargs)
 
-    # For CNN/DailyMail: drop the longer half based on article/description length
+    # For CNN/DailyMail: keep the shortest quarter based on article/description length
     if args.dataset_name == "cnn_dailymail":
 
         def _len_fn(x):
@@ -719,7 +748,7 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
         ds = ds.map(_len_fn, num_proc=1)
         ds = ds.sort("desc_len")
-        ds = ds.select(range(len(ds) // 2))
+        ds = ds.select(range(len(ds) // 4))
         ds = ds.remove_columns(["desc_len"])
 
     examples = []
