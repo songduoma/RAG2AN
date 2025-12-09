@@ -1,4 +1,4 @@
-# RAG²AN: Retrieval-Augmented Generator & Discriminator (GAN loop)
+# RAG²AN: Retrieval-Augmented Generator & Discriminator for Fake News GAN
 
 > Research/defense use only. Do not use this code to spread misinformation.
 
