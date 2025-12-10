@@ -1,4 +1,30 @@
 import os
+import requests
+
+def search_google_custom_api(q, num_results=10):
+    """
+    使用 Google Custom Search API 進行搜尋
+    需要設置環境變數: GOOGLE_CSE_API_KEY 和 GOOGLE_CSE_CX
+    """
+    api_key = os.environ.get("GOOGLE_CSE_API_KEY", "AIzaSyBQqWUfJ8Ql_3rIIjRrL6cMZN9Y0r9GJ20")
+    cx = os.environ.get("GOOGLE_CSE_CX", "00f433b36691d4048")
+    
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": q,
+        "num": min(num_results, 10)  # Google Custom Search API 最多返回 10 個結果
+    }
+    
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data
+    except Exception as e:
+        print(f"[Google Search] Error: {e}")
+        return {}
 
 def search_serpapi(q):
     try:
@@ -39,3 +65,26 @@ def get_google_ctx(q):
         return concat_snippets(search_results['organic_results'])
     else:
         return ""
+
+def get_google_custom_ctx(q, num_results=5):
+    """
+    使用 Google Custom Search API 獲取上下文
+    返回格式化的搜尋結果字串
+    """
+    search_results = search_google_custom_api(q, num_results=num_results)
+    if 'items' not in search_results or not search_results['items']:
+        return ""
+    
+    context_lines = []
+    for item in search_results['items'][:num_results]:
+        title = item.get('title', '')
+        snippet = item.get('snippet', '')
+        link = item.get('link', '')
+        
+        # 格式化為與 Wikipedia 類似的格式
+        line = f"- Title: {title}\n  Snippet: {snippet}"
+        if link:
+            line += f"\n  Link: {link}"
+        context_lines.append(line)
+    
+    return "\n".join(context_lines)

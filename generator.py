@@ -148,79 +148,50 @@ def search_wikipedia(
     query: str, num_results: int = 3, lang: str = "en", verbose: bool = False
 ) -> str:
     """
-    用 Wikipedia 官方 API 做簡單 RAG，從整篇文章挑出與 query 最相關的句子
+    使用 Google Custom Search API 進行搜尋（已替換原本的 Wikipedia API）
+    保持相同的函數簽名以維持向後相容性
     """
     if verbose:
-        print(f"[Wiki] query = {query!r}")
-
-    headers = {
-        "User-Agent": "NTU-ADL-FinalProject/0.1",
-        "Accept": "application/json",
-    }
+        print(f"[Google Search] query = {query!r}")
 
     try:
-        search_url = f"https://{lang}.wikipedia.org/w/api.php"
-        search_params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srlimit": num_results,
-            "format": "json",
+        # 使用 Google Custom Search API
+        api_key = os.environ.get("GOOGLE_CSE_API_KEY", "AIzaSyBQqWUfJ8Ql_3rIIjRrL6cMZN9Y0r9GJ20")
+        cx = os.environ.get("GOOGLE_CSE_CX", "00f433b36691d4048")
+        
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": api_key,
+            "cx": cx,
+            "q": query,
+            "num": min(num_results, 10)  # Google Custom Search API 最多返回 10 個結果
         }
 
-        r = requests.get(search_url, params=search_params, headers=headers, timeout=10)
-
-        if r.status_code != 200 or not r.text.strip().startswith("{"):
-            return ""
-
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
         data = r.json()
-        if "query" not in data or "search" not in data["query"]:
+
+        if "items" not in data or not data["items"]:
             return ""
 
         context_lines = []
-        for item in data["query"]["search"]:
+        for item in data["items"][:num_results]:
             title = item.get("title", "")
-            pageid = item.get("pageid")
+            snippet = item.get("snippet", "")
+            link = item.get("link", "")
 
-            extract = ""
-            if pageid is not None:
-                detail_params = {
-                    "action": "query",
-                    "prop": "extracts",
-                    "pageids": pageid,
-                    "explaintext": True,
-                    "exlimit": 1,
-                    "exsectionformat": "plain",
-                    "format": "json",
-                }
-                r2 = requests.get(
-                    search_url, params=detail_params, headers=headers, timeout=10
-                )
-                d2 = r2.json()
-                pages = d2.get("query", {}).get("pages", {})
-                page = pages.get(str(pageid), {})
-                extract = page.get("extract", "")
-
-            sentences = [
-                s.strip()
-                for s in re.split(r"(?<=[.!?])\s+", extract)
-                if s.strip()
-            ]
-            top_sentences = _top_k_sentences_by_embedding(
-                query, sentences, k=2
-            )
-
-            # Keep snippets compact to fit discriminator budget.
-            snippet = " ".join(top_sentences) if top_sentences else extract[:200]
+            # 保持與原本 Wikipedia 格式一致的輸出
             line = f"- Title: {title}\n  Snippet: {snippet}"
+            if link and verbose:
+                line += f"\n  Link: {link}"
             context_lines.append(line)
 
         context_text = "\n".join(context_lines)
         return context_text
 
     except Exception as e:
-        print(f"[Wiki] Error: {e}")
-        return f"- Title: Simulation\n  Snippet: Could not fetch Wikipedia for {query[:20]}."
+        print(f"[Google Search] Error: {e}")
+        return f"- Title: Simulation\n  Snippet: Could not fetch Google Search for {query[:20]}."
 
 
 # ==========================================
