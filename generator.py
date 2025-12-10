@@ -15,6 +15,9 @@ RAG²AN Generator - 支援 API 和本地模型兩種模式
 import copy
 import os
 import requests
+import math
+import re
+from collections import Counter
 from typing import Dict, Optional, Union
 
 # ==========================================
@@ -28,6 +31,14 @@ GEN_LORA_R = int(os.environ.get("GEN_LORA_R", "8"))
 GEN_LORA_ALPHA = int(os.environ.get("GEN_LORA_ALPHA", "16"))
 GEN_LORA_DROPOUT = float(os.environ.get("GEN_LORA_DROPOUT", "0.05"))
 GEN_MAX_NEW_TOKENS = int(os.environ.get("GEN_MAX_NEW_TOKENS", "512"))
+RAG_EMBED_MODEL = os.environ.get(
+    "RAG_EMBED_MODEL", "BAAI/bge-small-en-v1.5"
+)
+RAG_EMBED_QUERY_PREFIX = os.environ.get(
+    "RAG_EMBED_QUERY_PREFIX",
+    "Represent this sentence for searching relevant passages: ",
+)
+RAG_EMBED_DEVICE = os.environ.get("RAG_EMBED_DEVICE", "cpu").lower()
 
 # API 設定（OpenAI 相容）
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -44,12 +55,100 @@ MODEL_ID = LOCAL_MODEL_ID
 # 2. 工具函數: Wikipedia RAG
 # ==========================================
 
+_embedding_tokenizer = None
+_embedding_model = None
+_embedding_device = None
+
+
+def _embed_sentences(texts, batch_size: int = 32):
+    """
+    Encode sentences with a small sentence-transformer encoder for similarity.
+    Process in small batches to keep peak VRAM low.
+    """
+    global _embedding_model, _embedding_tokenizer, _embedding_device
+    import torch
+
+    if not texts:
+        return torch.empty(0)
+
+    if _embedding_model is None or _embedding_tokenizer is None:
+        from transformers import AutoModel, AutoTokenizer
+
+        _embedding_tokenizer = AutoTokenizer.from_pretrained(RAG_EMBED_MODEL)
+        preferred_device = RAG_EMBED_DEVICE
+        if preferred_device not in ("cpu", "cuda", "auto"):
+            preferred_device = "cpu"
+        _embedding_device = torch.device(
+            "cuda"
+            if preferred_device != "cpu" and torch.cuda.is_available()
+            else "cpu"
+        )
+        dtype = torch.float16 if _embedding_device.type == "cuda" else None
+        _embedding_model = AutoModel.from_pretrained(
+            RAG_EMBED_MODEL, torch_dtype=dtype
+        ).to(_embedding_device)
+        _embedding_model.eval()
+    all_embs = []
+    num_texts = len(texts)
+    for i in range(0, num_texts, batch_size):
+        batch_texts = texts[i : i + batch_size]
+        inputs = _embedding_tokenizer(
+            batch_texts, padding=True, truncation=True, return_tensors="pt"
+        )
+        inputs = {k: v.to(_embedding_device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = _embedding_model(**inputs)
+            hidden = outputs.last_hidden_state
+            mask = inputs["attention_mask"].unsqueeze(-1)
+            summed = (hidden * mask).sum(dim=1)
+            counts = mask.sum(dim=1).clamp(min=1)
+            embeddings = summed / counts
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+        all_embs.append(embeddings.cpu())
+
+        # 釋放本批張量，避免累積占用 GPU 快取
+        del inputs, outputs, hidden, mask, summed, counts, embeddings
+        if _embedding_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    return torch.cat(all_embs, dim=0)
+
+
+def _top_k_sentences_by_embedding(query: str, sentences, k: int = 2):
+    """Rank sentences with sentence embeddings (no fallback)."""
+    if not sentences:
+        return []
+    import torch
+
+    query_text = f"{RAG_EMBED_QUERY_PREFIX}{query}" if RAG_EMBED_QUERY_PREFIX else query
+    embs = _embed_sentences([query_text] + sentences)
+    query_emb, sent_embs = embs[0], embs[1:]
+    sims = torch.nn.functional.cosine_similarity(
+        sent_embs, query_emb.unsqueeze(0), dim=1
+    )
+    scored = list(zip(sentences, sims.tolist()))
+    top_sentences = [
+        s for s, _ in sorted(scored, key=lambda x: x[1], reverse=True)[:k]
+    ]
+    return top_sentences
+
+
+def _first_sentence(text: str, fallback_len: int = 150) -> str:
+    """Return the first sentence; fallback to first N chars if not found."""
+    if not text:
+        return ""
+    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if parts:
+        return parts[0]
+    return text[:fallback_len].strip()
+
 
 def search_wikipedia(
     query: str, num_results: int = 3, lang: str = "en", verbose: bool = False
 ) -> str:
     """
-    用 Wikipedia 官方 API 做簡單 RAG
+    用 Wikipedia 官方 API 做簡單 RAG，從整篇文章挑出與 query 最相關的句子
     """
     if verbose:
         print(f"[Wiki] query = {query!r}")
@@ -89,8 +188,9 @@ def search_wikipedia(
                     "action": "query",
                     "prop": "extracts",
                     "pageids": pageid,
-                    "exintro": True,
                     "explaintext": True,
+                    "exlimit": 1,
+                    "exsectionformat": "plain",
                     "format": "json",
                 }
                 r2 = requests.get(
@@ -101,7 +201,18 @@ def search_wikipedia(
                 page = pages.get(str(pageid), {})
                 extract = page.get("extract", "")
 
-            line = f"- Title: {title}\n  Snippet: {extract[:300]}"
+            sentences = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", extract)
+                if s.strip()
+            ]
+            top_sentences = _top_k_sentences_by_embedding(
+                query, sentences, k=2
+            )
+
+            # Keep snippets compact to fit discriminator budget.
+            snippet = " ".join(top_sentences) if top_sentences else extract[:200]
+            line = f"- Title: {title}\n  Snippet: {snippet}"
             context_lines.append(line)
 
         context_text = "\n".join(context_lines)
@@ -480,7 +591,7 @@ class FakeNewsGenerator:
         # RAG 處理
         rag_context = context_override if context_override is not None else ""
         if use_rag and context_override is None:
-            query = rag_query if rag_query else content[:50].replace("\n", " ")
+            query = rag_query if rag_query else _first_sentence(content)
             rag_context = search_wikipedia(
                 query, num_results=num_rag_results, lang=lang
             )

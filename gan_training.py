@@ -172,9 +172,12 @@ class GANTrainer:
         )  # Label smoothing 係數
 
     def _build_context(self, example: Dict[str, Any]) -> str:
+        # Respect generator_use_wiki flag: only fetch wiki context when enabled
         if self.args.rag_source == "none":
             return ""
         if self.args.rag_source == "wiki":
+            if not self.args.generator_use_wiki:
+                return ""
             query = example.get("title") or str(example.get("description", ""))[:50]
             return search_wikipedia(
                 query, num_results=self.args.num_rag_results, lang=self.args.rag_lang
@@ -739,7 +742,7 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
             load_kwargs["name"] = args.dataset_config
         ds = load_dataset(args.dataset_name, **load_kwargs)
 
-    # For CNN/DailyMail: keep the shortest quarter based on article/description length
+    # For CNN/DailyMail: keep the shortest 10k articles to speed training
     if args.dataset_name == "cnn_dailymail":
 
         def _len_fn(x):
@@ -748,8 +751,9 @@ def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
         ds = ds.map(_len_fn, num_proc=1)
         ds = ds.sort("desc_len")
-        ds = ds.select(range(len(ds) // 4))
+        ds = ds.select(range(min(len(ds), 10_000)))
         ds = ds.remove_columns(["desc_len"])
+        ds = ds.shuffle(seed=42)
 
     examples = []
     for row in ds:
@@ -791,7 +795,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-rounds", type=int, default=2)
     parser.add_argument("--discriminator-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Discriminator batch size (reduce if CUDA OOM).",
+    )
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max-length", type=int, default=MAX_ENCODER_SEQ_LEN)
     parser.add_argument(

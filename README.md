@@ -51,7 +51,7 @@ If you are not on CUDA 12.1, install torch/vision/audio wheels that match your s
   ```
 
 ## Key settings (env vars read by `train.sh`)
-- **Data**: `DATASET_NAME` (default `cnn_dailymail`), `DATASET_CONFIG` (e.g., `3.0.0`), `DATASET_SPLIT`, `REAL_SAMPLES_PER_ROUND` (default 500).
+- **Data**: `DATASET_NAME` (default `cnn_dailymail`), `DATASET_CONFIG` (e.g., `3.0.0`), `DATASET_SPLIT`, `REAL_SAMPLES_PER_ROUND` (default 500). For `cnn_dailymail`, the training loader always keeps the **shortest 10k articles** to reduce runtime.
 - **Generator**: `GEN_MODE`=`local|api`; local uses `GEN_MODEL` (default `Qwen/Qwen3-4B-Instruct-2507`); `GEN_USE_LORA`; `GEN_MAX_NEW_TOKENS`. API uses `OPENAI_MODEL` (default `gpt-4o-mini`) and `OPENAI_API_KEY`.
 - **LoRA mini-SFT**: `GEN_SFT_EVERY_ROUND`, `GEN_SFT_LR`, `GEN_SFT_STEPS`, `GEN_SFT_BATCH_SIZE`, `GEN_SFT_MAX_LENGTH`, `GEN_SFT_KL_WEIGHT`, `GEN_SFT_MAX_SAMPLES`, `GEN_SFT_SUCCESS_THRESHOLD`, `GEN_SFT_MAX_GRAD_NORM`, `GEN_SFT_WARMUP_ROUNDS`, `GEN_LORA_R/ALPHA/DROPOUT`.
 - **Discriminator**: `DISC_MODEL` (default `microsoft/deberta-v3-base`), `DISC_EPOCHS`, `BATCH_SIZE`, `LR`, `MAX_LENGTH`.

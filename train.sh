@@ -34,30 +34,33 @@ GEN_SFT_MAX_SAMPLES="${GEN_SFT_MAX_SAMPLES:-10}"
 GEN_SFT_SUCCESS_THRESHOLD="${GEN_SFT_SUCCESS_THRESHOLD:-0.5}"
 GEN_SFT_MAX_GRAD_NORM="${GEN_SFT_MAX_GRAD_NORM:-1.0}"
 GEN_SFT_WARMUP_ROUNDS="${GEN_SFT_WARMUP_ROUNDS:-10}"
-GEN_LORA_R="${GEN_LORA_R:-8}"
-GEN_LORA_ALPHA="${GEN_LORA_ALPHA:-16}"
+GEN_LORA_R="${GEN_LORA_R:-16}"
+GEN_LORA_ALPHA="${GEN_LORA_ALPHA:-32}"
 GEN_LORA_DROPOUT="${GEN_LORA_DROPOUT:-0.05}"
 GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-512}"
 
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-cnn_dailymail}"        # HF dataset id to load (e.g., cnn_dailymail)
 DATASET_CONFIG="${DATASET_CONFIG:-3.0.0}"            # optional dataset config/version
-DATASET_SPLIT="${DATASET_SPLIT:-train[:40000]}"         # HF split selector (smaller for API cost)
+DATASET_SPLIT="${DATASET_SPLIT:-train}"         # HF split selector (smaller for API cost)
 NUM_ROUNDS="${NUM_ROUNDS:-20}"                        # GAN rounds (generate + train disc)
 
 # --- 訓練設定 ---
 LOG_INTERVAL="${LOG_INTERVAL:-10}"                    # print progress every N samples
 DISC_EPOCHS="${DISC_EPOCHS:-1}"                      # epochs per round for discriminator
-BATCH_SIZE="${BATCH_SIZE:-2}"                        # discriminator batch size
+BATCH_SIZE="${BATCH_SIZE:-1}"                        # discriminator batch size
 LR="${LR:-1e-5}"                                     # discriminator learning rate
 MAX_LENGTH="${MAX_LENGTH:-512}"
 
 # --- RAG 設定 ---
 RAG_SOURCE="${RAG_SOURCE:-wiki}"                     # retrieval source: google | wiki | none
-DISC_USE_RAG="${DISC_USE_RAG:-0}"                    # 1 to include RAG context in discriminator input
+DISC_USE_RAG="${DISC_USE_RAG:-1}"                    # 1 to include RAG context in discriminator input
 GEN_USE_WIKI="${GEN_USE_WIKI:-1}"                    # 1 to let generator fallback to wiki when no context
 NUM_RAG_RESULTS="${NUM_RAG_RESULTS:-3}"              # number of RAG hits to fetch
 RAG_LANG="${RAG_LANG:-en}"                           # wiki language for RAG
+RAG_EMBED_MODEL="${RAG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}"  # sentence embedding model
+RAG_EMBED_QUERY_PREFIX="${RAG_EMBED_QUERY_PREFIX:-Represent this sentence for searching relevant passages: }"
+RAG_EMBED_DEVICE="${RAG_EMBED_DEVICE:-cuda}"                   # cpu | cuda | auto
 
 # --- 動態平衡設定（防止 D 壓制 G）---
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"            # Label smoothing (讓 D 學慢一點)
@@ -89,6 +92,9 @@ export GEN_LORA_DROPOUT="$GEN_LORA_DROPOUT"
 export GEN_MAX_NEW_TOKENS="$GEN_MAX_NEW_TOKENS"
 export ENCODER_DISCRIMINATOR_MODEL="$ENCODER_DISCRIMINATOR_MODEL"
 export ENCODER_DISCRIMINATOR_MAX_LEN="$ENCODER_DISCRIMINATOR_MAX_LEN"
+export RAG_EMBED_MODEL="$RAG_EMBED_MODEL"
+export RAG_EMBED_QUERY_PREFIX="$RAG_EMBED_QUERY_PREFIX"
+export RAG_EMBED_DEVICE="$RAG_EMBED_DEVICE"
 
 echo "============================================================"
 echo "VERBAL ADVERSARIAL FEEDBACK (VAF) TRAINING"
@@ -109,6 +115,8 @@ echo "Dataset:       $DATASET_NAME ($DATASET_SPLIT)"
 echo "Rounds:        $NUM_ROUNDS"
 echo "RAG Source:    $RAG_SOURCE (Disc RAG: $DISC_USE_RAG)"
 echo "Output:        $OUTPUT_DIR"
+echo "RAG Embed:     $RAG_EMBED_MODEL"
+echo "RAG Device:    $RAG_EMBED_DEVICE"
 echo "============================================================"
 
 python -u gan_training.py \

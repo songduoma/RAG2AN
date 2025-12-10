@@ -9,6 +9,7 @@ from transformers import (
 )
 
 from search import get_google_ctx
+from generator import search_wikipedia
 
 logging.set_verbosity_error()
 
@@ -280,8 +281,16 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
     if source == "google":
         text += get_google_ctx(example[prefix + "title"]) + "\n\n"
     elif source == "wiki":
-        # Discriminator side: we skip live Wikipedia calls here; rely on generator-side context
-        return ""
+        # Discriminator side: live wiki retrieval when enabled
+        lang = os.environ.get("RAG_LANG", "en")
+        try:
+            num_results = int(os.environ.get("NUM_RAG_RESULTS", "3"))
+        except ValueError:
+            num_results = 3
+        query = example.get(prefix + "title") or str(
+            example.get(prefix + "description", "")
+        )[:50]
+        return search_wikipedia(query, num_results=num_results, lang=lang)
     elif source == "none":
         return ""
     elif source == "dpr":
