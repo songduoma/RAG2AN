@@ -5,7 +5,7 @@ def search_serpapi(q):
         from serpapi import GoogleSearch  # lazy import to avoid hard dependency when google RAG is unused
     except Exception as exc:
         raise ImportError(
-            "serpapi is required for Google RAG. Install `google-search-results` or set RAG_SOURCE to wiki/none."
+            "serpapi is required for Google RAG. Install `google-search-results` or set RAG_SOURCE to none."
         ) from exc
 
     params = {

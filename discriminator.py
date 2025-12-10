@@ -9,7 +9,6 @@ from transformers import (
 )
 
 from search import get_google_ctx
-from generator import search_wikipedia
 
 logging.set_verbosity_error()
 
@@ -276,24 +275,23 @@ def get_encoder_discriminator(
 
 
 def get_retrieval_ctx(example, prefix, source="dpr"):
-    cnt = 0
-    text = "Related news stories from search results:\n\n"
+    """
+    Fetch retrieval context for an example. Google search is the default path.
+    """
+    if source == "none":
+        return ""
+
     if source == "google":
-        text += get_google_ctx(example[prefix + "title"]) + "\n\n"
-    elif source == "wiki":
-        # Discriminator side: live wiki retrieval when enabled
-        lang = os.environ.get("RAG_LANG", "en")
-        try:
-            num_results = int(os.environ.get("NUM_RAG_RESULTS", "3"))
-        except ValueError:
-            num_results = 3
+        text = "Related news stories from search results:\n\n"
         query = example.get(prefix + "title") or str(
             example.get(prefix + "description", "")
         )[:50]
-        return search_wikipedia(query, num_results=num_results, lang=lang)
-    elif source == "none":
-        return ""
-    elif source == "dpr":
+        google_ctx = get_google_ctx(query)
+        return text + google_ctx + "\n\n" if google_ctx else ""
+
+    if source == "dpr":
+        cnt = 0
+        text = "Related news stories from search results:\n\n"
         key = prefix + "dpr_retrieved_examples"
         if key not in example:
             return text
@@ -305,9 +303,9 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
             cnt += 1
             if cnt == 5:
                 break
-    else:
-        raise ValueError("Invalid source")
-    return text
+        return text
+
+    raise ValueError("Invalid source")
 
 
 def format_discriminator_input(

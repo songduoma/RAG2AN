@@ -23,7 +23,6 @@ from generator import (
     GEN_MODE,
     OPENAI_MODEL,
     FakeNewsGenerator,
-    search_wikipedia,
 )
 
 
@@ -172,19 +171,9 @@ class GANTrainer:
         )  # Label smoothing 係數
 
     def _build_context(self, example: Dict[str, Any]) -> str:
-        # Respect generator_use_wiki flag: only fetch wiki context when enabled
         if self.args.rag_source == "none":
             return ""
-        if self.args.rag_source == "wiki":
-            if not self.args.generator_use_wiki:
-                return ""
-            query = example.get("title") or str(example.get("description", ""))[:50]
-            return search_wikipedia(
-                query, num_results=self.args.num_rag_results, lang=self.args.rag_lang
-            )
-        if self.args.rag_source == "google":
-            return get_retrieval_ctx(example, prefix="", source="google")
-        return ""
+        return get_retrieval_ctx(example, prefix="", source=self.args.rag_source)
 
     def _collate(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         texts = [item["text"] for item in batch]
@@ -384,30 +373,17 @@ class GANTrainer:
 
             # Build retrieval context for the generator.
             rag_context = self._build_context(example)
-            if (
-                self.args.filter_no_wiki
-                and self.args.rag_source == "wiki"
-                and not rag_context.strip()
-            ):
-                # skip samples with no wiki hits when filtering is enabled
-                continue
-            # Only allow Wikipedia fallback when rag_source explicitly asks for wiki
-            use_wiki = (
-                self.args.generator_use_wiki
-                and self.args.rag_source == "wiki"
-                and not rag_context
-            )
+            use_rag = self.args.rag_source != "none"
 
             feedback = example.get("feedback_prompt")
             gen_output = self.generator.generate(
                 title=example.get("title", ""),
                 content=example.get("description", ""),
                 feedback_prompt=feedback,
-                use_rag=use_wiki,
+                use_rag=use_rag,
                 context_override=rag_context if rag_context else None,
                 rag_query=example.get("title", ""),
                 num_rag_results=self.args.num_rag_results,
-                lang=self.args.rag_lang,
                 train_mode=collect_train_signals,
             )
 
@@ -804,7 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max-length", type=int, default=MAX_ENCODER_SEQ_LEN)
     parser.add_argument(
-        "--rag-source", type=str, choices=["google", "wiki", "none"], default="wiki"
+        "--rag-source", type=str, choices=["google", "dpr", "none"], default="google"
     )
     parser.add_argument(
         "--disc-use-rag",
@@ -818,23 +794,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable RAG for discriminator input.",
     )
     parser.add_argument(
-        "--generator-use-wiki",
-        action="store_true",
-        help="Use Wikipedia when no external context is provided.",
+        "--num-rag-results",
+        type=int,
+        default=3,
+        help="Number of RAG search results (ignored for google search).",
     )
-    parser.add_argument(
-        "--no-generator-wiki",
-        dest="generator_use_wiki",
-        action="store_false",
-        help="Disable Wikipedia fallback.",
-    )
-    parser.add_argument(
-        "--filter-no-wiki",
-        action="store_true",
-        help="Skip samples whose wiki search returns empty context.",
-    )
-    parser.add_argument("--num-rag-results", type=int, default=3)
-    parser.add_argument("--rag-lang", type=str, default="en")
     parser.add_argument("--generator-model", type=str, default=MODEL_ID)
     parser.add_argument(
         "--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL
@@ -941,7 +905,7 @@ def parse_args() -> argparse.Namespace:
         help="Maximum consecutive rounds to skip discriminator training.",
     )
 
-    parser.set_defaults(disc_use_rag=False, generator_use_wiki=True)
+    parser.set_defaults(disc_use_rag=False)
     return parser.parse_args()
 
 

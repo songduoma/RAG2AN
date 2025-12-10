@@ -53,14 +53,9 @@ LR="${LR:-1e-5}"                                     # discriminator learning ra
 MAX_LENGTH="${MAX_LENGTH:-512}"
 
 # --- RAG 設定 ---
-RAG_SOURCE="${RAG_SOURCE:-wiki}"                     # retrieval source: google | wiki | none
+RAG_SOURCE="${RAG_SOURCE:-google}"                   # retrieval source: google | dpr | none
 DISC_USE_RAG="${DISC_USE_RAG:-1}"                    # 1 to include RAG context in discriminator input
-GEN_USE_WIKI="${GEN_USE_WIKI:-1}"                    # 1 to let generator fallback to wiki when no context
-NUM_RAG_RESULTS="${NUM_RAG_RESULTS:-3}"              # number of RAG hits to fetch
-RAG_LANG="${RAG_LANG:-en}"                           # wiki language for RAG
-RAG_EMBED_MODEL="${RAG_EMBED_MODEL:-BAAI/bge-small-en-v1.5}"  # sentence embedding model
-RAG_EMBED_QUERY_PREFIX="${RAG_EMBED_QUERY_PREFIX:-Represent this sentence for searching relevant passages: }"
-RAG_EMBED_DEVICE="${RAG_EMBED_DEVICE:-cuda}"                   # cpu | cuda | auto
+NUM_RAG_RESULTS="${NUM_RAG_RESULTS:-3}"              # number of RAG hits to fetch (ignored for google)
 
 # --- 動態平衡設定（防止 D 壓制 G）---
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.1}"            # Label smoothing (讓 D 學慢一點)
@@ -92,9 +87,6 @@ export GEN_LORA_DROPOUT="$GEN_LORA_DROPOUT"
 export GEN_MAX_NEW_TOKENS="$GEN_MAX_NEW_TOKENS"
 export ENCODER_DISCRIMINATOR_MODEL="$ENCODER_DISCRIMINATOR_MODEL"
 export ENCODER_DISCRIMINATOR_MAX_LEN="$ENCODER_DISCRIMINATOR_MAX_LEN"
-export RAG_EMBED_MODEL="$RAG_EMBED_MODEL"
-export RAG_EMBED_QUERY_PREFIX="$RAG_EMBED_QUERY_PREFIX"
-export RAG_EMBED_DEVICE="$RAG_EMBED_DEVICE"
 
 echo "============================================================"
 echo "VERBAL ADVERSARIAL FEEDBACK (VAF) TRAINING"
@@ -115,8 +107,6 @@ echo "Dataset:       $DATASET_NAME ($DATASET_SPLIT)"
 echo "Rounds:        $NUM_ROUNDS"
 echo "RAG Source:    $RAG_SOURCE (Disc RAG: $DISC_USE_RAG)"
 echo "Output:        $OUTPUT_DIR"
-echo "RAG Embed:     $RAG_EMBED_MODEL"
-echo "RAG Device:    $RAG_EMBED_DEVICE"
 echo "============================================================"
 
 python -u gan_training.py \
@@ -129,9 +119,7 @@ python -u gan_training.py \
   --lr "$LR" \
   --rag-source "$RAG_SOURCE" \
   $( [[ "$DISC_USE_RAG" == "1" ]] && echo "--disc-use-rag" || echo "--no-disc-rag" ) \
-  $( [[ "$GEN_USE_WIKI" == "1" ]] && echo "--generator-use-wiki" || echo "--no-generator-wiki" ) \
   --num-rag-results "$NUM_RAG_RESULTS" \
-  --rag-lang "$RAG_LANG" \
   --generator-model "$GEN_MODEL" \
   --discriminator-model "$DISC_MODEL" \
   $( [[ -n "$REAL_SAMPLES_PER_ROUND" ]] && echo "--real-samples-per-round $REAL_SAMPLES_PER_ROUND" ) \
