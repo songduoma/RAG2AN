@@ -27,11 +27,16 @@ def concat_snippets(organic_results):
     # filter out results without a snippet
     organic_results = [result for result in organic_results if 'snippet' in result]
     # filter out results from NBC News
-    organic_results = [result for result in organic_results if 'NBC' not in result['source'] and 'NBC' not in result['title']]
+    organic_results = [result for result in organic_results if 'NBC' not in result.get('source', '')]
     # filter out links containing 'fact'
     organic_results = [result for result in organic_results if 'fact' not in result['link']]
     organic_results = organic_results[:5]
-    return '\n'.join([f'Title: {result["title"]}\nSource: {result["source"]}, {result["date"] if "date" in result else ""}\nContent: {result["snippet"]}' for result in organic_results])
+    return "\n".join(
+        [
+            f"Source: {result.get('source', '')}, {result['date'] if 'date' in result else ''}\nContent: {result['snippet']}"
+            for result in organic_results
+        ]
+    )
 
 def get_google_ctx(q):
     search_results = search_serpapi(q)

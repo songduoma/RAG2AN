@@ -5,7 +5,7 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from datasets import Dataset as HFDataset, load_dataset, load_from_disk
@@ -171,9 +171,14 @@ class GANTrainer:
         )  # Label smoothing 係數
 
     def _build_context(self, example: Dict[str, Any]) -> str:
-        if self.args.rag_source == "none":
+        if self.args.rag_source == "none" or not getattr(self.args, "gen_use_rag", True):
             return ""
-        return get_retrieval_ctx(example, prefix="", source=self.args.rag_source)
+        return get_retrieval_ctx(
+            example,
+            prefix="",
+            source=self.args.rag_source,
+            num_results=self.args.num_rag_results,
+        )
 
     def _collate(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         texts = [item["text"] for item in batch]
@@ -299,11 +304,17 @@ class GANTrainer:
                 samples, k=min(self.gen_sft_batch_size, len(samples))
             )
             texts = []
+            prompt_token_lens = []
             for rec in batch:
                 prompt_text = rec.get("prompt_text", "")
                 fake_news = rec.get("fake_news_text", "")
                 combined = f"{prompt_text}\n{fake_news}".strip()
                 texts.append(combined)
+                prompt_prefix = f"{prompt_text}\n" if prompt_text else ""
+                prompt_ids = self.gen_tokenizer(
+                    prompt_prefix, add_special_tokens=False
+                )["input_ids"]
+                prompt_token_lens.append(len(prompt_ids))
 
             enc = self.gen_tokenizer(
                 texts,
@@ -311,16 +322,56 @@ class GANTrainer:
                 padding=True,
                 truncation=True,
                 max_length=self.gen_sft_max_length,
+                return_special_tokens_mask=True,
             ).to(device)
 
-            outputs = self.gen_model(**enc, labels=enc["input_ids"])
+            labels = enc["input_ids"].clone()
+            special_mask = enc.pop("special_tokens_mask")
+
+            for i, prompt_len in enumerate(prompt_token_lens):
+                labels[i][special_mask[i].bool()] = -100  # ignore special tokens
+                if prompt_len <= 0:
+                    continue
+                non_special_seen = 0
+                for j in range(labels.size(1)):
+                    if special_mask[i, j]:
+                        continue
+                    if non_special_seen < prompt_len:
+                        labels[i, j] = -100
+                        non_special_seen += 1
+                    else:
+                        break
+
+            enc["labels"] = labels
+            outputs = self.gen_model(**enc)
             ce_loss = outputs.loss
 
             # KL regularization against frozen base model to avoid drift
             kl_loss = 0.0
-            if self.gen_base_model is not None:
+            base_outputs = None
+            if hasattr(self.gen_model, "disable_adapter"):
+                active = getattr(self.gen_model, "active_adapters", None)
+                self.gen_model.disable_adapter()
+                with torch.no_grad():
+                    base_outputs = self.gen_model(**enc)
+                # restore adapters
+                if hasattr(self.gen_model, "set_adapter"):
+                    adapter_to_set = None
+                    if isinstance(active, (list, tuple)):
+                        adapter_to_set = active[0] if active else None
+                    else:
+                        adapter_to_set = active
+                    if adapter_to_set is not None:
+                        self.gen_model.set_adapter(adapter_to_set)
+                    elif hasattr(self.gen_model, "enable_adapter"):
+                        self.gen_model.enable_adapter()
+                elif hasattr(self.gen_model, "enable_adapter"):
+                    self.gen_model.enable_adapter()
+            elif self.gen_base_model is not None:
                 with torch.no_grad():
                     base_outputs = self.gen_base_model(**enc)
+
+            if base_outputs is not None:
                 kl_loss = torch.nn.functional.kl_div(
                     torch.nn.functional.log_softmax(outputs.logits, dim=-1),
                     torch.nn.functional.softmax(base_outputs.logits, dim=-1),
@@ -344,45 +395,37 @@ class GANTrainer:
         successful_records: List[Dict[str, Any]] = []
         collect_train_signals = self.gen_sft_enabled and self.gen_use_lora
 
-        def _truncate_text(text: str, limit: int = 800) -> str:
+        def _truncate_text(text: str, limit: int = 16000) -> str:
             if not isinstance(text, str):
                 text = str(text)
             return text if len(text) <= limit else text[:limit] + "... [truncated]"
 
-        first_real_ref: Optional[Dict[str, str]] = None
-        first_fake_ref: Optional[Dict[str, str]] = None
+        sample_refs: List[Dict[str, str]] = []
 
         for idx, example in enumerate(real_dataset, start=1):
+            real_article = (
+                example.get("description") or example.get("article") or ""
+            ).strip()
             # Compose discriminator input for the real article.
             real_text = format_discriminator_input(
                 example,
                 rag=self.args.disc_use_rag,
                 prefix="",
                 source=self.args.rag_source,
+                num_results=self.args.num_rag_results,
             )
             real_samples.append({"text": real_text, "label": 1})
-            if first_real_ref is None:
-                first_real_ref = {
-                    "title": (example.get("title") or "").strip(),
-                    "article": (
-                        example.get("description")
-                        or example.get("article")
-                        or ""
-                    ).strip(),
-                }
-
             # Build retrieval context for the generator.
             rag_context = self._build_context(example)
-            use_rag = self.args.rag_source != "none"
+            use_rag = self.args.rag_source != "none" and self.args.gen_use_rag
 
             feedback = example.get("feedback_prompt")
             gen_output = self.generator.generate(
-                title=example.get("title", ""),
                 content=example.get("description", ""),
                 feedback_prompt=feedback,
                 use_rag=use_rag,
                 context_override=rag_context if rag_context else None,
-                rag_query=example.get("title", ""),
+                rag_query=example.get("description", ""),
                 num_rag_results=self.args.num_rag_results,
                 train_mode=collect_train_signals,
             )
@@ -400,12 +443,14 @@ class GANTrainer:
 
             # 只保留生成的文章內容（Title/Body），避免把 prompt/指令餵給判別器
             gen_title, gen_body = extract_article(fake)
-            clean_generated = f"{gen_title}\n{gen_body}".strip()
-            if first_fake_ref is None:
-                first_fake_ref = {
-                    "title": gen_title.strip(),
-                    "body": gen_body.strip(),
-                }
+            clean_generated = (gen_body or gen_title or fake).strip()
+            if len(sample_refs) < 3:
+                sample_refs.append(
+                    {
+                        "real_article": real_article,
+                        "fake_article": clean_generated,
+                    }
+                )
 
             fake_disc_input = format_discriminator_input(
                 example,
@@ -413,6 +458,7 @@ class GANTrainer:
                 prefix="",
                 description_override=clean_generated,
                 source=self.args.rag_source,
+                num_results=self.args.num_rag_results,
             )
 
             # Temporarily switch to eval mode for stable inference; restore original mode after.
@@ -432,10 +478,12 @@ class GANTrainer:
                 self.discriminator.model.train()
 
             # 強化版 Feedback Prompt - 這是 "Verbal Adversarial Feedback" 的核心
+            predicted_real = fake_prob_true > detailed["prob_fake"]
+            predicted_label = "REAL" if predicted_real else "FAKE"
             feedback_lines = [
                 f"=== DISCRIMINATOR FEEDBACK (Round {round_id}) ===",
-                f"Detection Result: Your previous version was classified as FAKE",
-                f"Confidence: {detailed['confidence'].upper()} ({detailed['prob_fake']:.1%} fake probability)",
+                f"Detection Result: Your previous version was classified as {predicted_label}",
+                f"Confidence: {detailed['confidence'].upper()} ({fake_prob_true:.1%} real / {detailed['prob_fake']:.1%} fake)",
                 "",
                 "Problems Identified:",
             ]
@@ -639,12 +687,13 @@ class GANTrainer:
         }
 
         # 印出關鍵指標（方便觀察 G vs D 動態）
-        if first_real_ref and first_fake_ref:
-            print("  ┌─ Sample Inspection (first item of round)")
-            print(f"  │ [REAL] Title: {first_real_ref['title']}")
-            print(f"  │ [REAL] Article: {_truncate_text(first_real_ref['article'])}")
-            print(f"  │ [FAKE] Title: {first_fake_ref['title']}")
-            print(f"  │ [FAKE] Article: {_truncate_text(first_fake_ref['body'])}")
+        if sample_refs:
+            print("  ┌─ Sample Inspection (first items of round)")
+            for idx, ref in enumerate(sample_refs, start=1):
+                print(f"  │ [{idx}] [REAL] Article: {_truncate_text(ref['real_article'])}")
+                print(f"  │ [{idx}] [FAKE] Article: {_truncate_text(ref['fake_article'])}")
+                if idx != len(sample_refs):
+                    print("  │")
             print("  └─ End Sample Inspection\n")
         print(f"\n  ┌─────────────────────────────────────────────────────")
         print(f"  │ ROUND {round_id} SUMMARY - Verbal Adversarial Feedback")
@@ -710,45 +759,69 @@ class GANTrainer:
 
 
 def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    def _load_advfake_real_descriptions() -> Set[str]:
+        """
+        Load the 402 real descriptions from sanxing/advfake to avoid data leakage
+        during training. Falls back to cached arrow files if available.
+        """
+        candidates = [
+            Path("local/hf_datasets/advfake/advfake-train.arrow"),
+            Path.home()
+            / ".cache"
+            / "huggingface"
+            / "datasets"
+            / "sanxing___advfake"
+            / "default"
+            / "0.0.0"
+            / "a6ea082782834182eb80dbefd0152991495b37a5"
+            / "advfake-train.arrow",
+        ]
+
+        for path in candidates:
+            if path.exists():
+                ds = HFDataset.from_file(str(path))
+                return {
+                    (row.get("description") or "").strip()
+                    for row in ds
+                    if (row.get("description") or "").strip()
+                }
+
+        try:
+            ds = load_dataset(
+                "sanxing/advfake",
+                split="train",
+                download_mode="reuse_cache_if_exists",
+            )
+            return {
+                (row.get("description") or "").strip()
+                for row in ds
+                if (row.get("description") or "").strip()
+            }
+        except Exception as exc:  # noqa: BLE001 - best-effort optional path
+            print(f"Warning: could not load advfake for dedup; proceeding without it. ({exc})")
+            return set()
+
     if args.dataset_path and Path(args.dataset_path).exists():
         ds = load_from_disk(args.dataset_path)
     else:
-        load_kwargs = {"split": args.dataset_split}
-        if args.dataset_config:
-            load_kwargs["name"] = args.dataset_config
-        ds = load_dataset(args.dataset_name, **load_kwargs)
+        ds = load_dataset(args.dataset_name, split=args.dataset_split)
 
-    # For CNN/DailyMail: keep the shortest 10k articles to speed training
-    if args.dataset_name == "cnn_dailymail":
-
-        def _len_fn(x):
-            article = x.get("article", "") or x.get("description", "")
-            return {"desc_len": len(article)}
-
-        ds = ds.map(_len_fn, num_proc=1)
-        ds = ds.sort("desc_len")
-        ds = ds.select(range(min(len(ds), 10_000)))
-        ds = ds.remove_columns(["desc_len"])
-        ds = ds.shuffle(seed=42)
-
+    advfake_reals = _load_advfake_real_descriptions()
     examples = []
+    min_description_chars = 50  # drop ultra-short boilerplate like "All Time Latest News"
     for row in ds:
-        example = dict(row)
-
-        # Normalize common schemas
-        if "cnn_dailymail" in args.dataset_name:
-            # CNN/DailyMail: fields are article, highlights, id
-            article = row.get("article", "")
-            highlights = row.get("highlights", "")
-            example["title"] = highlights.strip() or article[:80].strip() or "Untitled"
-            example["description"] = article
-            example["date_publish"] = datetime.datetime.utcnow()
-        else:
-            example["date_publish"] = _normalize_date(example.get("date_publish"))
-            if "description" not in example and "text" in example:
-                example["description"] = example["text"]
-
-        examples.append(example)
+        description = (row.get("description") or row.get("text") or "").strip()
+        if not description:
+            continue
+        if len(description) < min_description_chars:
+            continue
+        if advfake_reals and description in advfake_reals:
+            continue
+        examples.append(
+            {
+                "description": description,
+            }
+        )
     return examples
 
 
@@ -756,15 +829,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="RAG-GAN training loop for fake news detection."
     )
-    parser.add_argument(
-        "--dataset-name", type=str, default="sanxing/advfake_news_please"
-    )
-    parser.add_argument(
-        "--dataset-config",
-        type=str,
-        default=None,
-        help="Optional dataset config/name (e.g., 3.0.0 for cnn_dailymail).",
-    )
+    parser.add_argument("--dataset-name", type=str, default="sanxing/advfake_news_please")
     parser.add_argument("--dataset-split", type=str, default="train")
     parser.add_argument(
         "--dataset-path", type=str, help="Optional local dataset path (load_from_disk)."
@@ -780,7 +845,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max-length", type=int, default=MAX_ENCODER_SEQ_LEN)
     parser.add_argument(
-        "--rag-source", type=str, choices=["google", "dpr", "none"], default="google"
+        "--rag-source", type=str, choices=["dpr", "none"], default="dpr"
+    )
+    parser.add_argument(
+        "--gen-use-rag",
+        action="store_true",
+        default=False,
+        help="Enable RAG context for generator input.",
+    )
+    parser.add_argument(
+        "--no-gen-rag",
+        dest="gen_use_rag",
+        action="store_false",
+        help="Disable RAG context for generator input.",
     )
     parser.add_argument(
         "--disc-use-rag",
@@ -797,7 +874,7 @@ def parse_args() -> argparse.Namespace:
         "--num-rag-results",
         type=int,
         default=3,
-        help="Number of RAG search results (ignored for google search).",
+        help="Number of DPR search results for retrieval context.",
     )
     parser.add_argument("--generator-model", type=str, default=MODEL_ID)
     parser.add_argument(

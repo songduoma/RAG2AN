@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+from typing import Optional
 
 import torch
 from transformers import (
@@ -8,7 +9,7 @@ from transformers import (
     logging,
 )
 
-from search import get_google_ctx
+from retrieval_dpr import get_dpr
 
 logging.set_verbosity_error()
 
@@ -38,11 +39,9 @@ class EncoderDiscriminator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-        # 加入 output_attentions=True
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             trust_remote_code=True,
-            output_attentions=True,
             use_safetensors=True,  # avoid torch.load vulnerability path on older torch
         ).to(self.device)
 
@@ -84,7 +83,9 @@ class EncoderDiscriminator:
             return_tensors="pt",
         ).to(self.device)
 
-        outputs = self.model(**inputs)
+        outputs = self.model(
+            **inputs, output_attentions=True, return_dict=True
+        )
 
         # 1. 抓取最後一層 Attention
         attentions = outputs.attentions[-1].cpu()
@@ -120,19 +121,25 @@ class EncoderDiscriminator:
 
     @torch.no_grad()
     def get_detailed_feedback(
-        self, text: str, rag_context: str = "", top_k: int = 5
+        self,
+        text: str,
+        rag_context: str = "",
+        top_k: int = 5,
+        high_conf_th: float = 0.8,
+        med_conf_th: float = 0.6,
+        factual_th: float = 0.7,
     ) -> dict:
         """
         提供更詳細的分析結果，用於強化 Generator 的 feedback。
 
         Returns:
             dict: {
-                "prob_true": float,           # 被判為真的機率
-                "prob_fake": float,           # 被判為假的機率
-                "confidence": str,            # 置信度等級 (high/medium/low)
-                "suspicious_words": list,     # [(word, score), ...]
-                "top_suspicious": str,        # 最可疑的詞
-                "detection_reason": str,      # 被偵測到的主要原因
+                "prob_true": float,
+                "prob_fake": float,
+                "confidence": str,                # high / medium / low
+                "suspicious_words": list,         # [(word, score), ...]
+                "top_suspicious": str,
+                "detection_reasons": list[str],   # 可能有多個 reason
                 "improvement_suggestions": list,  # 改進建議
             }
         """
@@ -144,34 +151,35 @@ class EncoderDiscriminator:
             return_tensors="pt",
         ).to(self.device)
 
-        outputs = self.model(**inputs)
+        outputs = self.model(
+            **inputs, output_attentions=True, return_dict=True
+        )
 
-        # 計算機率
+        # -------- 1. probability --------
         probs = torch.softmax(outputs.logits, dim=-1)
         prob_true = probs[0, self.positive_label_id].item()
         prob_fake = 1 - prob_true
 
-        # 判斷置信度
-        if prob_fake > 0.8:
+        # confidence bucket
+        if prob_fake >= high_conf_th:
             confidence = "high"
-        elif prob_fake > 0.6:
+        elif prob_fake >= med_conf_th:
             confidence = "medium"
         else:
             confidence = "low"
 
-        # 抓取 attention 分析可疑詞
-        attentions = outputs.attentions[-1].cpu()
-        avg_att = torch.mean(attentions, dim=1).squeeze(0)
-        cls_att = avg_att[0, :]
+        # -------- 2. attention → suspicious tokens --------
+        attentions = outputs.attentions[-1].cpu()          # (num_layers? or already last, heads, seq, seq)
+        avg_att = torch.mean(attentions, dim=1).squeeze(0) # (seq, seq)
+        cls_att = avg_att[0, :]                            # CLS 對其他 token 的注意力
 
         input_ids = inputs["input_ids"][0].cpu().numpy()
         special_mask = [
-            x
-            in [
+            x in (
                 self.tokenizer.cls_token_id,
                 self.tokenizer.sep_token_id,
                 self.tokenizer.pad_token_id,
-            ]
+            )
             for x in input_ids
         ]
         cls_att[special_mask] = 0
@@ -180,17 +188,17 @@ class EncoderDiscriminator:
 
         suspicious_words = []
         for idx, val in zip(indices, values):
-            word = self.tokenizer.decode([input_ids[idx]]).strip()
-            if word:  # 過濾空字串
-                suspicious_words.append((word, val.item()))
+            word = self.tokenizer.decode([int(input_ids[int(idx)])]).strip()
+            if word:
+                suspicious_words.append((word, float(val.item())))
 
         top_suspicious = suspicious_words[0][0] if suspicious_words else ""
 
-        # 分析偵測原因
-        detection_reasons = []
+        # -------- 3. detection reasons (multi-label) --------
+        detection_reasons: list[str] = []
         word_texts = [w[0].lower() for w in suspicious_words]
+        full_text = text.lower()
 
-        # 檢查常見假新聞特徵
         sensational_words = [
             "shocking",
             "unbelievable",
@@ -199,61 +207,76 @@ class EncoderDiscriminator:
             "bombshell",
             "stunning",
         ]
-        vague_sources = [
+
+        # phrase 與單字分開處理
+        vague_source_phrases = [
             "sources say",
+        ]
+        vague_source_tokens = [
             "reportedly",
             "allegedly",
             "anonymous",
             "insiders",
         ]
 
-        for word in word_texts:
-            if any(s in word for s in sensational_words):
-                detection_reasons.append("sensationalist_language")
-                break
+        # 3-1. sensationalist language
+        if any(any(s in w for s in sensational_words) for w in word_texts):
+            detection_reasons.append("sensationalist_language")
 
-        for word in word_texts:
-            if any(s in word for s in vague_sources):
-                detection_reasons.append("vague_attribution")
-                break
+        # 3-2. vague attribution (phrase + token)
+        hit_vague = False
+        if any(p in full_text for p in vague_source_phrases):
+            hit_vague = True
+        if any(any(v in w for v in vague_source_tokens) for w in word_texts):
+            hit_vague = True
+        if hit_vague:
+            detection_reasons.append("vague_attribution")
 
-        if prob_fake > 0.7 and not detection_reasons:
+        # 3-3. factual mismatch-ish (high fake prob, 但沒其他特徵)
+        if prob_fake >= factual_th and not detection_reasons:
             detection_reasons.append("factual_inconsistency")
 
+        # 3-4. fallback
         if not detection_reasons:
             detection_reasons.append("style_mismatch")
 
-        # 生成改進建議
-        suggestions = []
+        # -------- 4. suggestions --------
+        suggestions: list[str] = []
 
         if "sensationalist_language" in detection_reasons:
-            suggestions.append(
-                f"Replace sensationalist words like '{top_suspicious}' with neutral alternatives"
-            )
+            if top_suspicious:
+                suggestions.append(
+                    f"Replace sensationalist words like '{top_suspicious}' with more neutral wording."
+                )
+            else:
+                suggestions.append(
+                    "Reduce sensationalist wording and keep the tone more neutral."
+                )
 
         if "vague_attribution" in detection_reasons:
             suggestions.append(
-                "Use specific, named sources instead of vague attributions"
+                "Use specific, named sources (e.g., organizations, officials) instead of vague phrases like 'sources say' or 'reportedly'."
             )
 
         if "factual_inconsistency" in detection_reasons:
             suggestions.append(
-                "Ensure all facts align with the provided background context"
+                "Ensure the rewritten story stays internally consistent—names, dates, places, and outcomes should not contradict each other."
             )
 
         if "style_mismatch" in detection_reasons:
             suggestions.append(
-                "Match the formal, objective tone of professional journalism"
+                "Match the concise, factual tone and structure of the reference real articles (e.g., lead sentence, attribution style, paragraph length)."
             )
 
-        # 通用建議
-        suggestions.append(
-            f"Avoid or rephrase these flagged terms: {', '.join(word_texts[:3])}"
-        )
+        # 通用：標記前幾個可疑 token
+        if word_texts:
+            suggestions.append(
+                f"Review or rephrase these highly attended terms: {', '.join(word_texts[:3])}."
+            )
 
         if rag_context:
             suggestions.append(
-                "Cross-reference your claims with the RAG context provided"
+                "Use the retrieved context only as a style and phrasing reference; avoid importing unrelated facts or background details."
             )
 
         return {
@@ -274,34 +297,41 @@ def get_encoder_discriminator(
     return EncoderDiscriminator(model_name=model_name)
 
 
-def get_retrieval_ctx(example, prefix, source="dpr"):
+def get_retrieval_ctx(
+    example,
+    prefix,
+    source="dpr",
+    num_results: int = 5,
+    query_override: Optional[str] = None,
+):
     """
-    Fetch retrieval context for an example. Google search is the default path.
+    Fetch retrieval context for an example using local DPR results.
     """
     if source == "none":
         return ""
 
-    if source == "google":
-        text = "Related news stories from search results:\n\n"
-        query = example.get(prefix + "title") or str(
-            example.get(prefix + "description", "")
-        )[:50]
-        google_ctx = get_google_ctx(query)
-        return text + google_ctx + "\n\n" if google_ctx else ""
-
     if source == "dpr":
-        cnt = 0
         text = "Related news stories from search results:\n\n"
-        key = prefix + "dpr_retrieved_examples"
-        if key not in example:
+        # Use the actual text being classified (or override) as the query
+        query_src = (
+            query_override
+            if query_override is not None
+            else example.get(prefix + "description", "")
+        )
+        query = str(query_src)[:160].strip()
+        if not query:
             return text
-        for rex in example[key]:
-            if rex["url"] == example["url"]:
-                # skip the example itself
-                continue
-            text += f"{rex['date_publish'].date()} - {rex['title']}\n{rex['url']}\n{rex['description']}\n\n"
+
+        dpr = get_dpr()
+        scores, retrieved_examples = dpr.search(query, k=num_results)
+
+        cnt = 0
+        for score, rex in zip(scores, retrieved_examples):
+            desc = rex.get("description", "")
+
+            text += f"{desc}\n\n"
             cnt += 1
-            if cnt == 5:
+            if cnt >= num_results:
                 break
         return text
 
@@ -309,32 +339,37 @@ def get_retrieval_ctx(example, prefix, source="dpr"):
 
 
 def format_discriminator_input(
-    example, rag, prefix="", description_override=None, source="dpr"
+    example,
+    rag,
+    prefix="",
+    description_override=None,
+    source="dpr",
+    num_results: int = 5,
 ):
     """
     Build the discriminator input text with optional RAG context and content override.
     """
     text = ""
     if rag:
-        text += get_retrieval_ctx(example, prefix, source=source)
+        query_override = description_override if description_override is not None else None
+        text += get_retrieval_ctx(
+            example,
+            prefix,
+            source=source,
+            num_results=num_results,
+            query_override=query_override,
+        )
     if text and not text.endswith("\n\n"):
         text += "\n\n"
 
-    title = example.get(prefix + "title", "")
     description = (
         description_override
         if description_override is not None
         else example.get(prefix + "description", "")
     )
 
-    raw_date = example.get(prefix + "date_publish")
-    if hasattr(raw_date, "date"):
-        date_str = str(raw_date.date())
-    else:
-        date_str = str(raw_date) if raw_date is not None else "unknown-date"
-
     text += "Predict the plausibility of the following news story:\n\n"
-    text += f"{date_str} - {title}\n{description}\n\n"
+    text += f"{description}\n\n"
     return text
 
 
@@ -371,7 +406,7 @@ def get_score(example, rag, prefix="", rationale=False, model=None):
     }
 
 
-def get_dpr_results(example, dpr, search_key="title", prefix=""):
+def get_dpr_results(example, dpr, search_key="description", prefix=""):
     scores, retrieved_examples = dpr.search(example[prefix + search_key])
 
     # store score to each example
@@ -400,7 +435,7 @@ def get_new_dataset(ds, args):
     print("=" * 80)
 
     # score positives
-    ds = ds.map(lambda example: get_score(example, rag=False), num_proc=args.num_proc)
+    ds = ds.map(lambda example: get_score(example, rag=False), num_proc=1)
 
     ds.save_to_disk(str(args.path))
     return ds

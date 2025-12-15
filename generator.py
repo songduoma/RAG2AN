@@ -12,15 +12,10 @@ RAG²AN Generator - 支援 API 和本地模型兩種模式
         # 會自動載入 Qwen/Qwen2.5-7B-Instruct
 """
 
-import copy
 import os
 import requests
-import math
-import re
 from collections import Counter
 from typing import Dict, Optional, Union
-
-from search import get_google_ctx
 
 # ==========================================
 # 1. 配置設定 (Configuration)
@@ -45,30 +40,78 @@ LOCAL_MODEL_ID = os.environ.get("GEN_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 # 為了向後相容，保留 MODEL_ID
 MODEL_ID = LOCAL_MODEL_ID
 
-# ==========================================
-# 2. 工具函數: Google RAG
-# ==========================================
+FACT_CHANGE_INSTRUCTION = (
+    "CRITICAL: You MUST introduce 1–2 factual changes that meaningfully alter the story while keeping the SAME main event. "
+    "The article must still be about the same central event as the original (for example, the same speech, trial, accident, or policy decision). "
+    "In the VERY FIRST sentence of the rewritten article, you MUST change at least one core fact: WHO, WHERE, WHEN, a KEY NUMBER, or the OUTCOME. "
+    "You must NOT copy the first sentence verbatim; its wording and at least one core fact must be different from the original. "
+    "You may change who was involved, where it happened, when it happened, important numbers (amounts, years, percentages), or the cause/outcome of events. "
+    "Do not rely solely on paraphrasing. At least one factual element must change. "
+    "Do NOT invent a completely new, unrelated second event (such as a new protest, scandal, or case) that is not a direct variation of the original main event. "
+    "All changes must remain coherent with each other and with the (modified) main event."
+)
+
+LENGTH_CONSTRAINT = (
+    "Keep the rewritten article roughly within 80%–120% of the original length; do not make it significantly longer or shorter. "
+)
+
+STYLE_CONSTRAINT = (
+    "Write in a neutral, professional journalistic tone, avoid sensationalism, and do NOT use Markdown "
+    "formatting (no ###, no **, no bullet points). Keep the same paragraph structure and spacing as the original article. "
+)
+
+def _compute_max_new_tokens(content: str, tokenizer=None, global_cap: int = GEN_MAX_NEW_TOKENS) -> int:
+    """
+    Heuristic: keep generation close to the original length.
+    Uses tokenizer length when available; otherwise estimates from word count.
+    """
+    if tokenizer is not None:
+        ids = tokenizer(content, add_special_tokens=False)["input_ids"]
+        base_len = len(ids)
+    else:
+        # crude estimate: ~1.3 tokens per word
+        base_len = int(len(content.split()) * 1.3)
+    target = int(base_len * 1.15) + 5  # allow slight growth but avoid doubling
+    target = max(32, target)  # ensure not too small
+    return min(global_cap, target)
 
 
-def _first_sentence(text: str, fallback_len: int = 150) -> str:
-    """Return the first sentence; fallback to first N chars if not found."""
-    if not text:
+def _format_date(date_val: object) -> str:
+    if hasattr(date_val, "date"):
+        return str(date_val.date())
+    if isinstance(date_val, str) and date_val:
+        return date_val
+    return ""
+
+
+def build_rag_context(
+    rag_query: Optional[str], content: str, num_results: int = 3
+) -> str:
+    """
+    Build retrieval context using DPR over the news-please dataset.
+    - If rag_query is empty, fall back to the leading slice of content.
+    """
+    query = (rag_query or "").strip() or str(content or "")[:200].strip()
+    if not query:
         return ""
-    parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    if parts:
-        return parts[0]
-    return text[:fallback_len].strip()
 
+    from retrieval_dpr import get_dpr
 
-def search_google(query: str) -> str:
-    """Fetch contextual snippets via Google Search (SerpAPI)."""
-    return get_google_ctx(query)
+    dpr = get_dpr()
+    scores, retrieved_examples = dpr.search(query, k=num_results)
 
+    parts = ["Real news writing reference (for realism boundary only; not factual grounding):\n"]
+    cnt = 0
+    for score, rex in zip(scores, retrieved_examples):
+        desc = rex.get("description", "")
+        if not desc:
+            continue
+        parts.append(f"{desc}\n")
+        cnt += 1
+        if cnt >= num_results:
+            break
 
-# ==========================================
-# 3. API 引擎 (OpenAI 相容)
-# ==========================================
-
+    return "\n".join(parts).strip()
 
 class APIEngine:
     """使用 OpenAI API（或相容 API）生成文本"""
@@ -96,21 +139,20 @@ class APIEngine:
         if feedback_prompt:
             system_prompt = (
                 "You are a sophisticated writer engaged in an adversarial game against a fake news detector. "
-                "Your previous attempt was DETECTED as fake. You must learn from the feedback and adapt your strategy. "
-                "Your goal: rewrite the news to introduce subtle factual errors while EVADING detection. "
-                "KEY STRATEGY: The detector flagged specific words and patterns. You MUST avoid these tells. "
-                "Write in a neutral, professional journalistic tone. Avoid sensationalism. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "Your previous attempt was DETECTED as fake or too similar to the original article. "
+                "You must learn from the feedback and adapt your strategy. "
+                + FACT_CHANGE_INSTRUCTION
+                + STYLE_CONSTRAINT
+                + LENGTH_CONSTRAINT
             )
         else:
             system_prompt = (
                 "You are a sophisticated writer. Your task is to rewrite a real news story "
                 "to introduce believable factual errors or alter key entities (names, locations, events) "
                 "while maintaining the EXACT same journalistic tone and formatting style as the original. "
-                "The goal is to create a piece of 'Fake News' that is plausible enough to fool fact-checkers. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                + FACT_CHANGE_INSTRUCTION
+                + STYLE_CONSTRAINT
+                + LENGTH_CONSTRAINT
             )
 
         # 構建 feedback section
@@ -118,36 +160,59 @@ class APIEngine:
         if feedback_prompt:
             feedback_section = f"""
 
-╔══════════════════════════════════════════════════════════════╗
-║  CRITICAL: DISCRIMINATOR FEEDBACK - YOU MUST ADDRESS THIS    ║
-╚══════════════════════════════════════════════════════════════╝
+
+CRITICAL: DISCRIMINATOR FEEDBACK - YOU MUST ADDRESS THIS
 
 {feedback_prompt}
 
 YOUR ADAPTATION STRATEGY:
 1. First, identify which flagged words/phrases you used before
 2. Replace them with neutral, professional alternatives  
-3. Ensure your facts are internally consistent with the RAG context
+3. Use the RAG context to understand what kinds of changes are plausible in real news reporting. It defines a realism boundary, not facts to copy. Do NOT ensure factual consistency with it.
 4. Maintain a calm, objective journalistic voice throughout
 5. DO NOT use words like "shocking", "unbelievable", "sources say", etc.
 """
 
         user_prompt = f"""
-Background Information (RAG Context):
+Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
 {context}
+
+How to use the reference:
+- Use the retrieved articles as a realism boundary, not as facts to copy.
+- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
+- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
+- Do NOT copy specific facts, names, or sentences from the reference.
+- Do NOT introduce a new unrelated event.
+- If the reference conflicts with the original story, keep your story internally consistent.
+- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
 
 Original Real News:
 {content}{feedback_section}
 
 Task:
-Rewrite the news above to be fake but realistic. 
+Rewrite the news above to be fake but realistic.
+
+REQUIRED FACTUAL EDITS:
+- Introduce 1-2 factual modifications that change the meaning of the story.
+- At least ONE of the following must be changed:
+* the main person or organization involved,
+* the location,
+* the time/date or time period,
+* key numbers (amounts, years, percentages, counts),
+* the cause or the outcome of the events.
+- The modified story must remain coherent and plausible.
+- You MUST NOT merely paraphrase sentences or replace words with synonyms while keeping all facts the same.
+
 CRITICAL FORMATTING RULES:
-1. Do NOT use any Markdown formatting (no ###, no **, no bullet points)
-2. Do NOT add extra blank lines between paragraphs
-3. Keep the EXACT same paragraph structure as the original
-4. Start directly with the news content (e.g., "(CNN)..." or similar)
-5. Output ONLY the rewritten fake news article, nothing else
-        """.strip()
+1. Do NOT use any Markdown formatting (no ###, no **, no bullet points).
+2. Do NOT add extra blank lines between paragraphs.
+3. Keep the EXACT same paragraph structure as the original.
+4. Keep the overall length similar to the original article (stay roughly within ±20% of the original length).
+5. Do NOT add long background sections or speculative analysis that are not implied by the original article.
+6. Start directly with the news content (e.g., "(CNN)..." or similar).
+7. Output ONLY the rewritten fake news article, nothing else.
+8. DO NOT include the original text, headings, labels (e.g., "Modified version:"), or any explanations—only the final rewritten article content.
+""".strip()
 
         return system_prompt, user_prompt
 
@@ -168,15 +233,17 @@ CRITICAL FORMATTING RULES:
             "Content-Type": "application/json",
         }
 
+        max_tokens = _compute_max_new_tokens(real_news["text"], tokenizer=None)
+
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": GEN_MAX_NEW_TOKENS,
-            "temperature": 0.7,
-            "top_p": 0.9,
+            "max_tokens": max_tokens,
+            "temperature": 0.5,
+            "top_p": 0.8,
         }
 
         try:
@@ -228,10 +295,6 @@ class LocalEngine:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float16 if self.device.type == "cuda" else None
-        ).to(self.device)
-
         self.use_lora = GEN_USE_LORA
         if self.use_lora:
             lora_cfg = LoraConfig(
@@ -241,21 +304,25 @@ class LocalEngine:
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            self.model = get_peft_model(base_model, lora_cfg)
+            base = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if self.device.type == "cuda" else None,
+            ).to(self.device)
+            self.model = get_peft_model(base, lora_cfg)
             # 便於下游日誌顯示
             setattr(self.model, "lora_r", GEN_LORA_R)
             setattr(self.model, "lora_alpha", GEN_LORA_ALPHA)
             setattr(self.model, "lora_dropout", GEN_LORA_DROPOUT)
-            self.base_model = copy.deepcopy(base_model).eval()
-            for p in self.base_model.parameters():
-                p.requires_grad_(False)
+            self.base_model = None  # reuse same weights; disable adapters when needed for KL
             print(
                 f"[Local Engine] LoRA enabled (r={GEN_LORA_R}, alpha={GEN_LORA_ALPHA}, dropout={GEN_LORA_DROPOUT})"
             )
             if hasattr(self.model, "print_trainable_parameters"):
                 self.model.print_trainable_parameters()
         else:
-            self.model = base_model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=torch.float16 if self.device.type == "cuda" else None
+            ).to(self.device)
             self.base_model = None
 
         self.model.eval()
@@ -269,57 +336,79 @@ class LocalEngine:
         if feedback_prompt:
             system_prompt = (
                 "You are a sophisticated writer engaged in an adversarial game against a fake news detector. "
-                "Your previous attempt was DETECTED as fake. You must learn from the feedback and adapt your strategy. "
-                "Your goal: rewrite the news to introduce subtle factual errors while EVADING detection. "
-                "KEY STRATEGY: The detector flagged specific words and patterns. You MUST avoid these tells. "
-                "Write in a neutral, professional journalistic tone. Avoid sensationalism. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                "Your previous attempt was DETECTED as fake or too similar to the original article. "
+                "You must learn from the feedback and adapt your strategy. "
+                + FACT_CHANGE_INSTRUCTION
+                + STYLE_CONSTRAINT
+                + LENGTH_CONSTRAINT
             )
         else:
             system_prompt = (
                 "You are a sophisticated writer. Your task is to rewrite a real news story "
                 "to introduce believable factual errors or alter key entities (names, locations, events) "
                 "while maintaining the EXACT same journalistic tone and formatting style as the original. "
-                "The goal is to create a piece of 'Fake News' that is plausible enough to fool fact-checkers. "
-                "IMPORTANT: Do NOT use Markdown formatting (no ###, no **, no bullet points). "
-                "Keep the same paragraph structure and spacing as the original news article."
+                + FACT_CHANGE_INSTRUCTION
+                + STYLE_CONSTRAINT
+                + LENGTH_CONSTRAINT
             )
 
         feedback_section = ""
         if feedback_prompt:
             feedback_section = f"""
 
-╔══════════════════════════════════════════════════════════════╗
-║  CRITICAL: DISCRIMINATOR FEEDBACK - YOU MUST ADDRESS THIS    ║
-╚══════════════════════════════════════════════════════════════╝
 
+CRITICAL: DISCRIMINATOR FEEDBACK - YOU MUST ADDRESS THIS
 {feedback_prompt}
 
 YOUR ADAPTATION STRATEGY:
 1. First, identify which flagged words/phrases you used before
 2. Replace them with neutral, professional alternatives  
-3. Ensure your facts are internally consistent with the RAG context
+3. Use the RAG context to understand what kinds of changes are plausible in real news reporting. It defines a realism boundary, not facts to copy. Do NOT ensure factual consistency with it.
 4. Maintain a calm, objective journalistic voice throughout
 5. DO NOT use words like "shocking", "unbelievable", "sources say", etc.
 """
 
         user_prompt = f"""
-Background Information (RAG Context):
+Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
 {context}
+
+
+How to use the reference:
+- Use the retrieved articles as a realism boundary, not as facts to copy.
+- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
+- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
+- Do NOT copy specific facts, names, or sentences from the reference.
+- Do NOT introduce a new unrelated event.
+- If the reference conflicts with the original story, keep your story internally consistent.
+- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
 
 Original Real News:
 {content}{feedback_section}
 
 Task:
-Rewrite the news above to be fake but realistic. 
+Rewrite the news above to be fake but realistic.
+
+REQUIRED FACTUAL EDITS:
+- Introduce 1–2 factual modifications that change the meaning of the story.
+- At least ONE of the following must be changed:
+* the main person or organization involved,
+* the location,
+* the time/date or time period,
+* key numbers (amounts, years, percentages, counts),
+* the cause or the outcome of the events.
+- The modified story must remain coherent and plausible.
+- You MUST NOT merely paraphrase sentences or replace words with synonyms while keeping all facts the same.
+
 CRITICAL FORMATTING RULES:
-1. Do NOT use any Markdown formatting (no ###, no **, no bullet points)
-2. Do NOT add extra blank lines between paragraphs
-3. Keep the EXACT same paragraph structure as the original
-4. Start directly with the news content (e.g., "(CNN)..." or similar)
-5. Output ONLY the rewritten fake news article, nothing else
-        """.strip()
+1. Do NOT use any Markdown formatting (no ###, no **, no bullet points).
+2. Do NOT add extra blank lines between paragraphs.
+3. Keep the EXACT same paragraph structure as the original.
+4. Keep the overall length similar to the original article (stay roughly within ±20% of the original length).
+5. Do NOT add long background sections or speculative analysis that are not implied by the original article.
+6. Start directly with the news content (e.g., "(CNN)..." or similar).
+7. Output ONLY the rewritten fake news article, nothing else.
+8. DO NOT include the original text, headings, labels (e.g., "Modified version:"), or any explanations—only the final rewritten article content.
+""".strip()
 
         return system_prompt, user_prompt
 
@@ -348,15 +437,20 @@ CRITICAL FORMATTING RULES:
         enc = self.tokenizer(
             prompt, return_tensors="pt", add_special_tokens=False
         ).to(self.device)
+        
+        # 💡 根據原文長度動態決定 max_new_tokens，避免生成過長
+        dyn_max_new_tokens = _compute_max_new_tokens(
+            real_news["text"], tokenizer=self.tokenizer
+        )
 
         was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
             generated = self.model.generate(
                 **enc,
-                max_new_tokens=GEN_MAX_NEW_TOKENS,
-                temperature=0.7,
-                top_p=0.9,
+                max_new_tokens=dyn_max_new_tokens,
+                temperature=0.5,
+                top_p=0.8,
                 do_sample=True,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
@@ -417,7 +511,6 @@ class FakeNewsGenerator:
 
     def generate(
         self,
-        title: str,
         content: str,
         feedback_prompt: str = None,
         use_rag: bool = True,
@@ -428,13 +521,16 @@ class FakeNewsGenerator:
         train_mode: bool = False,
     ) -> Union[str, Dict[str, object]]:
         """生成假新聞"""
-        real_news = {"title": title, "text": content}
+        real_news = {"text": content}
 
-        # RAG 處理
+        # RAG 處理：優先使用 context_override；否則用 DPR 取 top-k 內文 context
         rag_context = context_override if context_override is not None else ""
         if use_rag and context_override is None:
-            query = rag_query if rag_query else _first_sentence(content)
-            rag_context = search_google(query)
+            rag_context = build_rag_context(
+                rag_query=rag_query,
+                content=content,
+                num_results=num_rag_results,
+            )
 
         fake_news = self.engine.generate_fake_news(
             real_news, rag_context, feedback_prompt, train_mode=train_mode
@@ -450,7 +546,6 @@ _global_generator = None
 
 
 def generator(
-    title: str,
     content: str,
     feedback_prompt: str = None,
     use_rag: bool = True,
@@ -466,7 +561,6 @@ def generator(
         _global_generator = FakeNewsGenerator(model_id=model_id)
 
     return _global_generator.generate(
-        title,
         content,
         feedback_prompt,
         use_rag,
@@ -476,6 +570,12 @@ def generator(
         lang,
         train_mode=False,
     )
+
+
+def reset_generator():
+    """Reset the shared generator instance so new settings take effect."""
+    global _global_generator
+    _global_generator = None
 
 
 # ==========================================
@@ -492,7 +592,6 @@ def main():
 
     # 測試新聞
     test_news = {
-        "title": "Tech Company Announces New Product",
         "text": """(CNN) Apple announced today that it will release a new iPhone model next month. 
 The company's CEO Tim Cook revealed the news at a press conference in Cupertino, California.
 The new device is expected to feature improved battery life and a faster processor.
@@ -505,7 +604,6 @@ Industry analysts predict strong sales for the holiday season.""",
     print("\n[Generating fake version...]")
     gen = FakeNewsGenerator()
     fake = gen.generate(
-        title=test_news["title"],
         content=test_news["text"],
         use_rag=True,
     )
@@ -531,7 +629,6 @@ Improvement Instructions:
 """
 
     fake_v2 = gen.generate(
-        title=test_news["title"],
         content=test_news["text"],
         feedback_prompt=feedback,
         use_rag=True,
