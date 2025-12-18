@@ -153,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models-dir",
         type=Path,
-        default=Path("local/rag_gan_runs/gen_on_dis_on"),
+        default=Path("local/rag_gan_runs/G+D+_neither"),
         help="Directory containing disc_round_* checkpoints.",
     )
     parser.add_argument(
@@ -257,32 +257,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
-"""
-G+ / D+
-=== RAG Evaluation Summary ===
-disc_round_1          Macro-F1: 0.6337  ROC-AUC: 0.8377  Accuracy: 0.6592
-disc_round_2          Macro-F1: 0.7754  ROC-AUC: 0.8765  Accuracy: 0.7823
-disc_round_3          Macro-F1: 0.7693  ROC-AUC: 0.8729  Accuracy: 0.7761
-disc_round_4          Macro-F1: 0.7257  ROC-AUC: 0.8338  Accuracy: 0.7264
-disc_round_5          Macro-F1: 0.7754  ROC-AUC: 0.8654  Accuracy: 0.7761
-disc_round_6          Macro-F1: 0.7572  ROC-AUC: 0.9129  Accuracy: 0.7674
-disc_round_7          Macro-F1: 0.7923  ROC-AUC: 0.8806  Accuracy: 0.7960
-disc_round_8          Macro-F1: 0.8075  ROC-AUC: 0.8919  Accuracy: 0.8085
-disc_round_9          Macro-F1: 0.7948  ROC-AUC: 0.8965  Accuracy: 0.7985
-disc_round_10         Macro-F1: 0.8119  ROC-AUC: 0.9035  Accuracy: 0.8134
-
-
-G− / D+
-=== RAG Evaluation Summary ===
-disc_round_1          Macro-F1: 0.7029  ROC-AUC: 0.7184  Accuracy: 0.7226
-disc_round_2          Macro-F1: 0.7418  ROC-AUC: 0.8452  Accuracy: 0.7488
-disc_round_3          Macro-F1: 0.7577  ROC-AUC: 0.8453  Accuracy: 0.7587
-disc_round_4          Macro-F1: 0.7512  ROC-AUC: 0.8200  Accuracy: 0.7525
-disc_round_5          Macro-F1: 0.7722  ROC-AUC: 0.8577  Accuracy: 0.7774
-disc_round_6          Macro-F1: 0.8059  ROC-AUC: 0.8970  Accuracy: 0.8060
-disc_round_7          Macro-F1: 0.7843  ROC-AUC: 0.8482  Accuracy: 0.7861
-disc_round_8          Macro-F1: 0.7180  ROC-AUC: 0.8530  Accuracy: 0.7239
-disc_round_9          Macro-F1: 0.8077  ROC-AUC: 0.8871  Accuracy: 0.8085
-disc_round_10         Macro-F1: 0.8015  ROC-AUC: 0.8867  Accuracy: 0.8022
-"""

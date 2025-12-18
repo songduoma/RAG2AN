@@ -105,6 +105,8 @@ class GANTrainer:
     def __init__(self, args: argparse.Namespace, dataset: List[Dict[str, Any]]):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.use_vaf_feedback = getattr(args, "use_vaf_feedback", True)
+        self.use_vaf_fewshot = getattr(args, "use_vaf_fewshot", True)
         self.generator = FakeNewsGenerator(model_id=args.generator_model)
         self.discriminator = get_encoder_discriminator(
             model_name=args.discriminator_model
@@ -406,6 +408,14 @@ class GANTrainer:
             real_article = (
                 example.get("description") or example.get("article") or ""
             ).strip()
+
+            # Optionally remove any carried-over feedback when VAF is disabled.
+            if (
+                not (self.use_vaf_feedback or self.use_vaf_fewshot)
+                and "feedback_prompt" in example
+            ):
+                example.pop("feedback_prompt", None)
+
             # Compose discriminator input for the real article.
             real_text = format_discriminator_input(
                 example,
@@ -419,7 +429,11 @@ class GANTrainer:
             rag_context = self._build_context(example)
             use_rag = self.args.rag_source != "none" and self.args.gen_use_rag
 
-            feedback = example.get("feedback_prompt")
+            feedback = (
+                example.get("feedback_prompt")
+                if (self.use_vaf_feedback or self.use_vaf_fewshot)
+                else None
+            )
             gen_output = self.generator.generate(
                 content=example.get("description", ""),
                 feedback_prompt=feedback,
@@ -477,38 +491,41 @@ class GANTrainer:
             if prev_training:
                 self.discriminator.model.train()
 
-            # 強化版 Feedback Prompt - 這是 "Verbal Adversarial Feedback" 的核心
-            predicted_real = fake_prob_true > detailed["prob_fake"]
-            predicted_label = "REAL" if predicted_real else "FAKE"
-            feedback_lines = [
-                f"=== DISCRIMINATOR FEEDBACK (Round {round_id}) ===",
-                f"Detection Result: Your previous version was classified as {predicted_label}",
-                f"Confidence: {detailed['confidence'].upper()} ({fake_prob_true:.1%} real / {detailed['prob_fake']:.1%} fake)",
-                "",
-                "Problems Identified:",
-            ]
+            feedback_lines: List[str] = []
+            # 強化版 Feedback Prompt - "Verbal Adversarial Feedback" 元件
+            if self.use_vaf_feedback:
+                predicted_real = fake_prob_true > detailed["prob_fake"]
+                predicted_label = "REAL" if predicted_real else "FAKE"
+                feedback_lines.extend(
+                    [
+                        f"=== DISCRIMINATOR FEEDBACK (Round {round_id}) ===",
+                        f"Detection Result: Your previous version was classified as {predicted_label}",
+                        f"Confidence: {detailed['confidence'].upper()} ({fake_prob_true:.1%} real / {detailed['prob_fake']:.1%} fake)",
+                        "",
+                        "Problems Identified:",
+                    ]
+                )
 
-            for i, reason in enumerate(detailed["detection_reasons"], 1):
-                reason_readable = reason.replace("_", " ").title()
-                feedback_lines.append(f"  {i}. {reason_readable}")
+                for i, reason in enumerate(detailed["detection_reasons"], 1):
+                    reason_readable = reason.replace("_", " ").title()
+                    feedback_lines.append(f"  {i}. {reason_readable}")
 
-            feedback_lines.append("")
-            feedback_lines.append(f"Flagged Suspicious Terms: {suspicious}")
-            feedback_lines.append("")
-            feedback_lines.append("Improvement Instructions:")
-
-            for i, suggestion in enumerate(detailed["improvement_suggestions"], 1):
-                feedback_lines.append(f"  {i}. {suggestion}")
-
-            # === 新增：Few-shot 成功案例 ===
-            if self.successful_examples:
                 feedback_lines.append("")
+                feedback_lines.append(f"Flagged Suspicious Terms: {suspicious}")
+                feedback_lines.append("")
+                feedback_lines.append("Improvement Instructions:")
+
+                for i, suggestion in enumerate(detailed["improvement_suggestions"], 1):
+                    feedback_lines.append(f"  {i}. {suggestion}")
+
+            # === Few-shot 成功案例 ===
+            if self.use_vaf_fewshot and self.successful_examples:
+                if feedback_lines:
+                    feedback_lines.append("")
                 feedback_lines.append("=" * 50)
                 feedback_lines.append("SUCCESSFUL EXAMPLE (This fooled the detector!):")
                 feedback_lines.append("=" * 50)
-                # 取最近一個成功案例
                 best_example = self.successful_examples[-1]
-                # 只取前 500 字避免 prompt 太長
                 feedback_lines.append(best_example["text"][:500])
                 feedback_lines.append("...")
                 feedback_lines.append(
@@ -519,12 +536,12 @@ class GANTrainer:
                     "LEARN FROM THIS: Mimic the style and tone of the successful example above."
                 )
 
-            feedback_lines.append("")
-            feedback_lines.append(
-                "CRITICAL: Your rewrite MUST address these issues to pass detection."
-            )
-
-            example["feedback_prompt"] = "\n".join(feedback_lines)
+            if feedback_lines:
+                feedback_lines.append("")
+                feedback_lines.append(
+                    "CRITICAL: Your rewrite MUST address these issues to pass detection."
+                )
+                example["feedback_prompt"] = "\n".join(feedback_lines)
 
             fake_samples.append(
                 {
@@ -535,7 +552,7 @@ class GANTrainer:
                     "confidence": detailed["confidence"],
                     "suspicious_words": suspicious,
                     "detection_reasons": detailed["detection_reasons"],
-                    "feedback_prompt": example["feedback_prompt"],
+                    "feedback_prompt": example.get("feedback_prompt"),
                     "generated_content": clean_generated,  # 保存生成內容，用於 few-shot
                     "prompt_text": prompt_text,
                     "prompt_ids": prompt_ids,
@@ -554,38 +571,42 @@ class GANTrainer:
         fool_rate = fooled_count / max(len(fake_samples), 1)
 
         # 收集成功騙過 D 的案例（需為假新聞且 fooled）
-        new_successes = [
-            s
-            for s in fake_samples
-            if s.get("label", 1) == 0
-            and s.get("fool")
-            and s.get("prob_true", 0.0) > self.gen_success_threshold
-        ]
-        if new_successes:
-            # 按 prob_true 排序，取最好的
-            new_successes.sort(key=lambda x: x["prob_true"], reverse=True)
-            for s in new_successes[:3]:  # 最多加 3 個
-                self.successful_examples.append(
-                    {
-                        "text": s.get("generated_content", s["text"][:500]),
-                        "prob_true": s["prob_true"],
-                    }
+        new_successes: List[Dict[str, Any]] = []
+        if self.gen_sft_enabled or self.use_vaf_fewshot:
+            new_successes = [
+                s
+                for s in fake_samples
+                if s.get("label", 1) == 0
+                and s.get("fool")
+                and s.get("prob_true", 0.0) > self.gen_success_threshold
+            ]
+            if new_successes:
+                # 按 prob_true 排序，取最好的
+                new_successes.sort(key=lambda x: x["prob_true"], reverse=True)
+                for s in new_successes[:3]:  # 最多加 3 個
+                    if self.use_vaf_fewshot:
+                        self.successful_examples.append(
+                            {
+                                "text": s.get("generated_content", s["text"][:500]),
+                                "prob_true": s["prob_true"],
+                            }
+                        )
+                    successful_records.append(
+                        {
+                            "prompt_text": s.get("prompt_text", ""),
+                            "fake_news_text": s.get("generated_content", ""),
+                            "prob_true": s["prob_true"],
+                            "prompt_ids": s.get("prompt_ids"),
+                            "generated_ids": s.get("generated_ids"),
+                            "fool": s.get("fool", True),
+                        }
+                    )
+                # 只保留最近 5 個成功案例（僅在 VAF 開啟時使用）
+                if self.use_vaf_fewshot:
+                    self.successful_examples = self.successful_examples[-5:]
+                print(
+                    f"  ✓ Collected {len(new_successes)} successful examples (total: {len(self.successful_examples)})"
                 )
-                successful_records.append(
-                    {
-                        "prompt_text": s.get("prompt_text", ""),
-                        "fake_news_text": s.get("generated_content", ""),
-                        "prob_true": s["prob_true"],
-                        "prompt_ids": s.get("prompt_ids"),
-                        "generated_ids": s.get("generated_ids"),
-                        "fool": s.get("fool", True),
-                    }
-                )
-            # 只保留最近 5 個成功案例
-            self.successful_examples = self.successful_examples[-5:]
-            print(
-                f"  ✓ Collected {len(new_successes)} successful examples (total: {len(self.successful_examples)})"
-            )
 
         # === 新增：動態平衡 - 決定是否訓練 D ===
         skip_training = False
@@ -695,8 +716,9 @@ class GANTrainer:
                 if idx != len(sample_refs):
                     print("  │")
             print("  └─ End Sample Inspection\n")
+        vaf_status = f"feedback={'ON' if self.use_vaf_feedback else 'OFF'}, few-shot={'ON' if self.use_vaf_fewshot else 'OFF'}"
         print(f"\n  ┌─────────────────────────────────────────────────────")
-        print(f"  │ ROUND {round_id} SUMMARY - Verbal Adversarial Feedback")
+        print(f"  │ ROUND {round_id} SUMMARY - Verbal Adversarial Feedback ({vaf_status})")
         print(f"  ├─────────────────────────────────────────────────────")
         print(f"  │ Generator Performance:")
         print(f"  │   Mean P(real): {mean_prob_true:.3f}  (↑ = G improving)")
@@ -980,6 +1002,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Maximum consecutive rounds to skip discriminator training.",
+    )
+    parser.add_argument(
+        "--use-vaf-feedback",
+        action="store_true",
+        default=os.environ.get("USE_VAF_FEEDBACK", "1").lower()
+        in ("1", "true", "yes"),
+        help="Enable the discriminator feedback block in generator prompts.",
+    )
+    parser.add_argument(
+        "--no-vaf-feedback",
+        dest="use_vaf_feedback",
+        action="store_false",
+        help="Disable discriminator feedback block in generator prompts.",
+    )
+    parser.add_argument(
+        "--use-vaf-fewshot",
+        action="store_true",
+        default=os.environ.get("USE_VAF_FEWSHOT", "1").lower()
+        in ("1", "true", "yes"),
+        help="Include successful fake examples as few-shot hints in generator prompts.",
+    )
+    parser.add_argument(
+        "--no-vaf-fewshot",
+        dest="use_vaf_fewshot",
+        action="store_false",
+        help="Disable few-shot successful example insertion.",
     )
 
     parser.set_defaults(disc_use_rag=False)

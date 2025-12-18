@@ -62,6 +62,7 @@ OUTPUT_DIR=local/runs/quick_$(date +%H%M%S) \
 - **Discriminator**: `DISC_MODEL`, `DISC_EPOCHS`, `BATCH_SIZE`, `LR`, `MAX_LENGTH`.
 - **Retrieval**: `RAG_SOURCE` (`dpr|none`), `DISC_USE_RAG`, `GEN_USE_RAG`, `NUM_RAG_RESULTS`.
 - **Dynamic balance**: `LABEL_SMOOTHING`, `MIN_FOOL_RATE`, `MAX_SKIP_ROUNDS`.
+- **Verbal Adversarial Feedback**: `USE_VAF_FEEDBACK` (insert discriminator feedback block), `USE_VAF_FEWSHOT` (insert successful example few-shot block). Legacy `USE_VAF` sets both at once.
 - **Output/logging**: `OUTPUT_DIR` (default `local/rag_gan_runs/<timestamp>`), `LOG_INTERVAL`, `LOG_FILE`.
 
 ## Direct script call

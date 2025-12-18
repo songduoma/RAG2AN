@@ -43,7 +43,7 @@ GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-128}"
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-sanxing/advfake_news_please}"       # HF dataset id to load
 DATASET_SPLIT="${DATASET_SPLIT:-train[:10000]}"
-NUM_ROUNDS="${NUM_ROUNDS:-10}"                         # GAN rounds (generate + train disc)
+NUM_ROUNDS="${NUM_ROUNDS:-6}"                         # GAN rounds (generate + train disc)
 
 # --- 訓練設定 ---
 LOG_INTERVAL="${LOG_INTERVAL:-10}"                    # print progress every N samples
@@ -55,8 +55,10 @@ MAX_LENGTH="${MAX_LENGTH:-512}"
 # --- RAG 設定 ---
 RAG_SOURCE="${RAG_SOURCE:-dpr}"                      # retrieval source: dpr | none
 DISC_USE_RAG="${DISC_USE_RAG:-0}"                    # 1 to include RAG context in discriminator input
-GEN_USE_RAG="${GEN_USE_RAG:-0}"                      # 1 to include RAG context in generator input
+GEN_USE_RAG="${GEN_USE_RAG:-1}"                      # 1 to include RAG context in generator input
 NUM_RAG_RESULTS="${NUM_RAG_RESULTS:-3}"              # number of RAG hits to fetch
+USE_VAF_FEEDBACK="${USE_VAF_FEEDBACK:-${USE_VAF:-0}}" # 1 to insert discriminator feedback block
+USE_VAF_FEWSHOT="${USE_VAF_FEWSHOT:-${USE_VAF:-0}}"   # 1 to include few-shot successful examples
 
 # --- 動態平衡設定（防止 D 壓制 G）---
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0}"            # Label smoothing (讓 D 學慢一點)
@@ -112,6 +114,8 @@ echo "Discriminator: $DISC_MODEL"
 echo "Dataset:       $DATASET_NAME ($DATASET_SPLIT)"
 echo "Rounds:        $NUM_ROUNDS"
 echo "RAG Source:    $RAG_SOURCE (Disc RAG: $DISC_USE_RAG)"
+echo "VAF Feedback:  $( [[ \"$USE_VAF_FEEDBACK\" == \"1\" ]] && echo ON || echo OFF )"
+echo "VAF Few-shot:  $( [[ \"$USE_VAF_FEWSHOT\" == \"1\" ]] && echo ON || echo OFF )"
 echo "Output:        $OUTPUT_DIR"
 echo "============================================================"
 
@@ -144,7 +148,9 @@ python -u gan_training.py \
   --max-length "${MAX_LENGTH}" \
   --label-smoothing "$LABEL_SMOOTHING" \
   --min-fool-rate-to-train "$MIN_FOOL_RATE" \
-  --max-skip-rounds "$MAX_SKIP_ROUNDS"
+  --max-skip-rounds "$MAX_SKIP_ROUNDS" \
+  $( [[ "$USE_VAF_FEEDBACK" == "1" ]] && echo "--use-vaf-feedback" || echo "--no-vaf-feedback" ) \
+  $( [[ "$USE_VAF_FEWSHOT" == "1" ]] && echo "--use-vaf-fewshot" || echo "--no-vaf-fewshot" )
 
 echo "============================================================"
 echo "Training run finished. Outputs saved to: $OUTPUT_DIR"
