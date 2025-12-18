@@ -9,8 +9,8 @@ RAG²AN links a retrieval-augmented generator with a DeBERTa-based discriminator
 - **Dynamic balance**: label smoothing, fool-rate-triggered pauses, and forced resumes keep the discriminator from overpowering the generator.
 - **Few-shot cache**: up to five fake articles that fooled the discriminator are stored and replayed in future prompts.
 - **LoRA mini-SFT**: in local mode high-score fakes fine-tune the generator (KL-regularized, gradient-clipped, warm-up enabled) using LoRA adapters only.
-- **Local DPR retrieval**: `retrieval_dpr.py` builds and caches a FAISS index under `local/news-please/faiss_index` on first use; both generator and discriminator can inject that context.
-- **Data hygiene**: `gan_training.py` filters `sanxing/advfake_news_please`, drops very short boilerplate, and removes the 402 real descriptions from `sanxing/advfake` to avoid leakage.
+- **Local DPR retrieval**: `src/retrieval_dpr.py` builds and caches a FAISS index under `local/news-please/faiss_index` on first use; both generator and discriminator can inject that context.
+- **Data hygiene**: `scripts/gan_training.py` filters `sanxing/advfake_news_please`, drops very short boilerplate, and removes the 402 real descriptions from `sanxing/advfake` to avoid leakage.
 
 ## Requirements & setup
 - Python 3.10+.
@@ -66,9 +66,9 @@ OUTPUT_DIR=local/runs/quick_$(date +%H%M%S) \
 - **Output/logging**: `OUTPUT_DIR` (default `local/rag_gan_runs/<timestamp>`), `LOG_INTERVAL`, `LOG_FILE`.
 
 ## Direct script call
-Every train.sh flag maps to `gan_training.py` CLI arguments:
+Every train.sh flag maps to `scripts/gan_training.py` CLI arguments:
 ```bash
-python -u gan_training.py \
+python -u scripts/gan_training.py \
   --dataset-name sanxing/advfake_news_please \
   --dataset-split train[:1000] \
   --num-rounds 2 \
@@ -98,7 +98,7 @@ Two scripts score saved checkpoints on `sanxing/advfake`:
 
 1. **Plain inputs**:
    ```bash
-   python evaluate_discriminator.py \
+   python scripts/evaluate_discriminator.py \
      --models-dir local/rag_gan_runs/<run_name> \
      --dataset-path local/hf_datasets/advfake/advfake-train.arrow \
      --batch-size 8
@@ -107,7 +107,7 @@ Two scripts score saved checkpoints on `sanxing/advfake`:
 
 2. **RAG-augmented inputs**:
    ```bash
-   python evaluate_discriminator_with_rag.py \
+   python scripts/evaluate_discriminator_with_rag.py \
      --models-dir local/rag_gan_runs/<run_name> \
      --dataset-path local/hf_datasets/advfake/advfake-train.arrow \
      --rag-source dpr \
@@ -121,11 +121,11 @@ The scripts print Macro-F1 / ROC-AUC / Accuracy per checkpoint plus a round-by-r
 ## Generator demo
 ```bash
 # Local mode needs GPU; API mode needs OPENAI_API_KEY
-python generator.py
+python -m src.generator
 ```
 Programmatic use:
 ```python
-from generator import FakeNewsGenerator
+from src.generator import FakeNewsGenerator
 
 gen = FakeNewsGenerator()
 sample = gen.generate(

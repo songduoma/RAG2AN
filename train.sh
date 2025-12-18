@@ -119,7 +119,7 @@ echo "VAF Few-shot:  $( [[ \"$USE_VAF_FEWSHOT\" == \"1\" ]] && echo ON || echo O
 echo "Output:        $OUTPUT_DIR"
 echo "============================================================"
 
-python -u gan_training.py \
+python -u scripts/gan_training.py \
   --dataset-name "$DATASET_NAME" \
   --dataset-split "$DATASET_SPLIT" \
   --num-rounds "$NUM_ROUNDS" \

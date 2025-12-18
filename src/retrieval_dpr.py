@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from news import DPR
+from .news import DPR
 
 
 @lru_cache(maxsize=1)

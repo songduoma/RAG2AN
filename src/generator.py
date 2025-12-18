@@ -95,7 +95,7 @@ def build_rag_context(
     if not query:
         return ""
 
-    from retrieval_dpr import get_dpr
+    from .retrieval_dpr import get_dpr
 
     dpr = get_dpr()
     scores, retrieved_examples = dpr.search(query, k=num_results)

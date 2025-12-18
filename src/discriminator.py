@@ -9,7 +9,7 @@ from transformers import (
     logging,
 )
 
-from retrieval_dpr import get_dpr
+from .retrieval_dpr import get_dpr
 
 logging.set_verbosity_error()
 

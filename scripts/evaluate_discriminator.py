@@ -8,6 +8,7 @@ Macro-F1 and ROC-AUC.
 """
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -15,7 +16,11 @@ import torch
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-from discriminator import EncoderDiscriminator, MAX_ENCODER_SEQ_LEN
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.discriminator import EncoderDiscriminator, MAX_ENCODER_SEQ_LEN
 
 
 def _clean_text(val) -> str:

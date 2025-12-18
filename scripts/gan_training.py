@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -11,14 +12,18 @@ import torch
 from datasets import Dataset as HFDataset, load_dataset, load_from_disk
 from torch.utils.data import DataLoader, Dataset
 
-from discriminator import (
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.discriminator import (
     DEFAULT_ENCODER_MODEL,
     MAX_ENCODER_SEQ_LEN,
     format_discriminator_input,
     get_encoder_discriminator,
     get_retrieval_ctx,
 )
-from generator import (
+from src.generator import (
     MODEL_ID,
     GEN_MODE,
     OPENAI_MODEL,
