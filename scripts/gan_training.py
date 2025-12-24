@@ -114,7 +114,8 @@ class GANTrainer:
         self.use_vaf_fewshot = getattr(args, "use_vaf_fewshot", True)
         self.generator = FakeNewsGenerator(model_id=args.generator_model)
         self.discriminator = get_encoder_discriminator(
-            model_name=args.discriminator_model
+            model_name=args.discriminator_model,
+            positive_label_id=getattr(args, "disc_positive_label_id", None),
         )
         self.discriminator.model.train()
         self.optimizer = torch.optim.AdamW(
@@ -158,10 +159,54 @@ class GANTrainer:
         self.dataset = dataset
         self.dataset_len = len(dataset)
         self.real_samples_per_round = self._determine_samples_per_round()
+        self.disc_real_samples_per_round = (
+            args.disc_real_samples_per_round
+            if getattr(args, "disc_real_samples_per_round", None) is not None
+            else self.real_samples_per_round
+        )
+        self.disc_real_sampling = getattr(args, "disc_real_sampling", "random")
+        self.disc_real_exclude_gen = getattr(args, "disc_real_exclude_gen", False)
+        self.gen_real_fixed = getattr(args, "gen_real_fixed", False)
         self.max_unique_rounds = math.ceil(
             self.dataset_len / self.real_samples_per_round
         )
         self._wrapped_warned = False
+        if self.gen_real_fixed:
+            self.generator_real_samples = self._get_real_samples_for_round(
+                1,
+                dataset=self.dataset,
+                samples_per_round=self.real_samples_per_round,
+            )
+            self._generator_real_descriptions = {
+                (ex.get("description") or "").strip()
+                for ex in self.generator_real_samples
+                if (ex.get("description") or "").strip()
+            }
+        else:
+            self.generator_real_samples = []
+            self._generator_real_descriptions = set()
+        if self.disc_real_exclude_gen:
+            if not self.gen_real_fixed:
+                print(
+                    "Warning: disc-real-exclude-gen is enabled but generator real samples are not fixed; "
+                    "disabling exclusion to avoid inconsistent pools."
+                )
+                self.disc_real_exclude_gen = False
+            pool = [
+                ex
+                for ex in self.dataset
+                if (ex.get("description") or "").strip()
+                not in self._generator_real_descriptions
+            ]
+            if not pool:
+                print(
+                    "Warning: discriminator real pool is empty after excluding generator samples; "
+                    "falling back to full dataset."
+                )
+                pool = list(self.dataset)
+            self.disc_real_pool = pool
+        else:
+            self.disc_real_pool = list(self.dataset)
 
         # === 新增：動態平衡與 Few-shot 學習 ===
         self.successful_examples = []  # 存儲騙過 D 的成功案例 (最多保留 5 個)
@@ -396,7 +441,12 @@ class GANTrainer:
         self.gen_model.eval()
     def run_round(self, round_id: int) -> Dict[str, Any]:
         print(f"\n===== Round {round_id} =====")
-        real_dataset = self._get_real_samples_for_round(round_id)
+        generator_dataset = (
+            self.generator_real_samples
+            if self.gen_real_fixed
+            else self._get_real_samples_for_round(round_id)
+        )
+        disc_real_dataset = self._get_discriminator_real_samples(round_id)
         real_samples: List[Dict[str, Any]] = []
         fake_samples: List[Dict[str, Any]] = []
         successful_records: List[Dict[str, Any]] = []
@@ -409,7 +459,17 @@ class GANTrainer:
 
         sample_refs: List[Dict[str, str]] = []
 
-        for idx, example in enumerate(real_dataset, start=1):
+        for example in disc_real_dataset:
+            real_text = format_discriminator_input(
+                example,
+                rag=self.args.disc_use_rag,
+                prefix="",
+                source=self.args.rag_source,
+                num_results=self.args.num_rag_results,
+            )
+            real_samples.append({"text": real_text, "label": 1})
+
+        for idx, example in enumerate(generator_dataset, start=1):
             real_article = (
                 example.get("description") or example.get("article") or ""
             ).strip()
@@ -421,17 +481,15 @@ class GANTrainer:
             ):
                 example.pop("feedback_prompt", None)
 
-            # Compose discriminator input for the real article.
-            real_text = format_discriminator_input(
-                example,
-                rag=self.args.disc_use_rag,
-                prefix="",
-                source=self.args.rag_source,
-                num_results=self.args.num_rag_results,
-            )
-            real_samples.append({"text": real_text, "label": 1})
-            # Build retrieval context for the generator.
-            rag_context = self._build_context(example)
+            # Avoid redundant DPR calls: only build context for feedback when G is not using RAG.
+            rag_context = ""
+            if self.use_vaf_feedback and not self.args.gen_use_rag and self.args.rag_source != "none":
+                rag_context = get_retrieval_ctx(
+                    example,
+                    prefix="",
+                    source=self.args.rag_source,
+                    num_results=self.args.num_rag_results,
+                )
             use_rag = self.args.rag_source != "none" and self.args.gen_use_rag
 
             feedback = (
@@ -443,7 +501,6 @@ class GANTrainer:
                 content=example.get("description", ""),
                 feedback_prompt=feedback,
                 use_rag=use_rag,
-                context_override=rag_context if rag_context else None,
                 rag_query=example.get("description", ""),
                 num_rag_results=self.args.num_rag_results,
                 train_mode=collect_train_signals,
@@ -566,8 +623,8 @@ class GANTrainer:
                 }
             )
 
-            if idx % self.args.log_interval == 0 or idx == len(real_dataset):
-                total = len(real_dataset)
+            if idx % self.args.log_interval == 0 or idx == len(generator_dataset):
+                total = len(generator_dataset)
                 print(f"  Processed {idx}/{total} samples (generation + disc prep)")
 
         # === 新增：先計算 fool_rate，收集成功案例 ===
@@ -769,20 +826,49 @@ class GANTrainer:
             return min(inferred, self.dataset_len)
         return self.dataset_len
 
-    def _get_real_samples_for_round(self, round_id: int) -> List[Dict[str, Any]]:
-        start = (round_id - 1) * self.real_samples_per_round
-        if start >= self.dataset_len and not self._wrapped_warned:
+    def _get_real_samples_for_round(
+        self,
+        round_id: int,
+        dataset: Optional[List[Dict[str, Any]]] = None,
+        samples_per_round: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        ds = dataset if dataset is not None else self.dataset
+        per_round = (
+            samples_per_round
+            if samples_per_round is not None
+            else self.real_samples_per_round
+        )
+        ds_len = len(ds)
+        if ds_len == 0:
+            return []
+        start = (round_id - 1) * per_round
+        if dataset is None and start >= self.dataset_len and not self._wrapped_warned:
             print(
                 f"  Note: only {self.dataset_len} unique real samples are available "
                 f"and each round uses {self.real_samples_per_round}; "
                 f"rounds beyond {self.max_unique_rounds} will reuse examples."
             )
             self._wrapped_warned = True
-        start_mod = start % self.dataset_len
-        end = start_mod + self.real_samples_per_round
-        if end <= self.dataset_len:
-            return self.dataset[start_mod:end]
-        return self.dataset[start_mod:] + self.dataset[: end - self.dataset_len]
+        start_mod = start % ds_len
+        end = start_mod + per_round
+        if end <= ds_len:
+            return ds[start_mod:end]
+        return ds[start_mod:] + ds[: end - ds_len]
+
+    def _get_discriminator_real_samples(self, round_id: int) -> List[Dict[str, Any]]:
+        pool = self.disc_real_pool
+        per_round = self.disc_real_samples_per_round
+        if not pool:
+            return self._get_real_samples_for_round(round_id)
+        if self.disc_real_sampling == "cycle":
+            return self._get_real_samples_for_round(
+                round_id,
+                dataset=pool,
+                samples_per_round=per_round,
+            )
+        if per_round <= len(pool):
+            return random.sample(pool, per_round)
+        return [random.choice(pool) for _ in range(per_round)]
 
 
 def load_news_data(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -908,6 +994,12 @@ def parse_args() -> argparse.Namespace:
         "--discriminator-model", type=str, default=DEFAULT_ENCODER_MODEL
     )
     parser.add_argument(
+        "--disc-positive-label-id",
+        type=int,
+        default=None,
+        help="Override discriminator positive label id (useful when id2label is LABEL_0/LABEL_1).",
+    )
+    parser.add_argument(
         "--gen-sft-every-round",
         action="store_true",
         default=os.environ.get("GEN_SFT_EVERY_ROUND", "0").lower()
@@ -988,6 +1080,45 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Number of real samples to cycle through each round to keep batches disjoint.",
     )
+    parser.add_argument(
+        "--gen-real-fixed",
+        action="store_true",
+        default=False,
+        help="Keep generator real samples fixed across all rounds.",
+    )
+    parser.add_argument(
+        "--no-gen-real-fixed",
+        dest="gen_real_fixed",
+        action="store_false",
+        default=False,
+        help="Cycle generator real samples by round (default behavior).",
+    )
+    parser.add_argument(
+        "--disc-real-samples-per-round",
+        type=int,
+        default=None,
+        help="Number of real samples for discriminator each round (defaults to real-samples-per-round).",
+    )
+    parser.add_argument(
+        "--disc-real-sampling",
+        type=str,
+        choices=["random", "cycle"],
+        default="random",
+        help="How to select real samples for discriminator each round.",
+    )
+    parser.add_argument(
+        "--disc-real-exclude-gen",
+        action="store_true",
+        default=False,
+        help="Exclude generator real samples from discriminator real pool.",
+    )
+    parser.add_argument(
+        "--no-disc-real-exclude-gen",
+        dest="disc_real_exclude_gen",
+        action="store_false",
+        default=False,
+        help="Allow discriminator real samples to overlap with generator real samples.",
+    )
 
     # === 動態平衡參數 ===
     parser.add_argument(
@@ -1007,6 +1138,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="Maximum consecutive rounds to skip discriminator training.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling and training.",
     )
     parser.add_argument(
         "--use-vaf-feedback",
@@ -1043,6 +1180,12 @@ def main() -> None:
     import json
 
     args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # 顯示 Generator 模式
     print("\n" + "=" * 60)

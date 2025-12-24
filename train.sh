@@ -38,18 +38,18 @@ GEN_SFT_WARMUP_ROUNDS="${GEN_SFT_WARMUP_ROUNDS:-10}"
 GEN_LORA_R="${GEN_LORA_R:-16}"
 GEN_LORA_ALPHA="${GEN_LORA_ALPHA:-32}"
 GEN_LORA_DROPOUT="${GEN_LORA_DROPOUT:-0.05}"
-GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-128}"
+GEN_MAX_NEW_TOKENS="${GEN_MAX_NEW_TOKENS:-256}"
 
 # --- 資料集設定 ---
 DATASET_NAME="${DATASET_NAME:-sanxing/advfake_news_please}"       # HF dataset id to load
-DATASET_SPLIT="${DATASET_SPLIT:-train[:10000]}"
+DATASET_SPLIT="${DATASET_SPLIT:-train[:100000]}"
 NUM_ROUNDS="${NUM_ROUNDS:-6}"                         # GAN rounds (generate + train disc)
 
 # --- 訓練設定 ---
 LOG_INTERVAL="${LOG_INTERVAL:-10}"                    # print progress every N samples
-DISC_EPOCHS="${DISC_EPOCHS:-2}"                      # epochs per round for discriminator
+DISC_EPOCHS="${DISC_EPOCHS:-1}"                      # epochs per round for discriminator
 BATCH_SIZE="${BATCH_SIZE:-2}"                        # discriminator batch size
-LR="${LR:-1e-5}"                                     # discriminator learning rate
+LR="${LR:-5e-6}"                                     # discriminator learning rate
 MAX_LENGTH="${MAX_LENGTH:-512}"
 
 # --- RAG 設定 ---
@@ -57,8 +57,8 @@ RAG_SOURCE="${RAG_SOURCE:-dpr}"                      # retrieval source: dpr | n
 DISC_USE_RAG="${DISC_USE_RAG:-0}"                    # 1 to include RAG context in discriminator input
 GEN_USE_RAG="${GEN_USE_RAG:-1}"                      # 1 to include RAG context in generator input
 NUM_RAG_RESULTS="${NUM_RAG_RESULTS:-3}"              # number of RAG hits to fetch
-USE_VAF_FEEDBACK="${USE_VAF_FEEDBACK:-${USE_VAF:-0}}" # 1 to insert discriminator feedback block
-USE_VAF_FEWSHOT="${USE_VAF_FEWSHOT:-${USE_VAF:-0}}"   # 1 to include few-shot successful examples
+USE_VAF_FEEDBACK="${USE_VAF_FEEDBACK:-${USE_VAF:-1}}" # 1 to insert discriminator feedback block
+USE_VAF_FEWSHOT="${USE_VAF_FEWSHOT:-${USE_VAF:-1}}"   # 1 to include few-shot successful examples
 
 # --- 動態平衡設定（防止 D 壓制 G）---
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0}"            # Label smoothing (讓 D 學慢一點)
@@ -70,6 +70,12 @@ DISC_MODEL="${DISC_MODEL:-microsoft/deberta-v3-base}" # discriminator model id
 ENCODER_DISCRIMINATOR_MODEL="${ENCODER_DISCRIMINATOR_MODEL:-$DISC_MODEL}"
 ENCODER_DISCRIMINATOR_MAX_LEN="${ENCODER_DISCRIMINATOR_MAX_LEN:-$MAX_LENGTH}"
 REAL_SAMPLES_PER_ROUND="${REAL_SAMPLES_PER_ROUND:-500}"
+GEN_REAL_FIXED="${GEN_REAL_FIXED:-1}"
+DISC_REAL_SAMPLES_PER_ROUND="${DISC_REAL_SAMPLES_PER_ROUND:-$REAL_SAMPLES_PER_ROUND}"
+DISC_REAL_SAMPLING="${DISC_REAL_SAMPLING:-random}"
+DISC_REAL_EXCLUDE_GEN="${DISC_REAL_EXCLUDE_GEN:-1}"
+DISC_POSITIVE_LABEL_ID="${DISC_POSITIVE_LABEL_ID:-}"
+SEED="${SEED:-0}"
 
 # --- 輸出設定 ---
 OUTPUT_DIR="${OUTPUT_DIR:-local/rag_gan_runs/$(date +%Y%m%d_%H%M%S)}"
@@ -91,6 +97,7 @@ export GEN_LORA_DROPOUT="$GEN_LORA_DROPOUT"
 export GEN_MAX_NEW_TOKENS="$GEN_MAX_NEW_TOKENS"
 export ENCODER_DISCRIMINATOR_MODEL="$ENCODER_DISCRIMINATOR_MODEL"
 export ENCODER_DISCRIMINATOR_MAX_LEN="$ENCODER_DISCRIMINATOR_MAX_LEN"
+export ENCODER_POSITIVE_LABEL_ID="${ENCODER_POSITIVE_LABEL_ID:-}"
 
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -113,7 +120,10 @@ fi
 echo "Discriminator: $DISC_MODEL"
 echo "Dataset:       $DATASET_NAME ($DATASET_SPLIT)"
 echo "Rounds:        $NUM_ROUNDS"
-echo "RAG Source:    $RAG_SOURCE (Disc RAG: $DISC_USE_RAG)"
+echo "G Real Fixed:  $GEN_REAL_FIXED"
+echo "D Real Sample: $DISC_REAL_SAMPLES_PER_ROUND ($DISC_REAL_SAMPLING, exclude G: $DISC_REAL_EXCLUDE_GEN)"
+echo "Seed:          $SEED"
+echo "RAG Source:    $RAG_SOURCE (Disc RAG: $DISC_USE_RAG, Gen RAG: $GEN_USE_RAG)"
 echo "VAF Feedback:  $( [[ \"$USE_VAF_FEEDBACK\" == \"1\" ]] && echo ON || echo OFF )"
 echo "VAF Few-shot:  $( [[ \"$USE_VAF_FEWSHOT\" == \"1\" ]] && echo ON || echo OFF )"
 echo "Output:        $OUTPUT_DIR"
@@ -133,6 +143,10 @@ python -u scripts/gan_training.py \
   --generator-model "$GEN_MODEL" \
   --discriminator-model "$DISC_MODEL" \
   $( [[ -n "$REAL_SAMPLES_PER_ROUND" ]] && echo "--real-samples-per-round $REAL_SAMPLES_PER_ROUND" ) \
+  $( [[ "$GEN_REAL_FIXED" == "1" ]] && echo "--gen-real-fixed" || echo "--no-gen-real-fixed" ) \
+  $( [[ -n "$DISC_REAL_SAMPLES_PER_ROUND" ]] && echo "--disc-real-samples-per-round $DISC_REAL_SAMPLES_PER_ROUND" ) \
+  --disc-real-sampling "$DISC_REAL_SAMPLING" \
+  $( [[ "$DISC_REAL_EXCLUDE_GEN" == "1" ]] && echo "--disc-real-exclude-gen" || echo "--no-disc-real-exclude-gen" ) \
   $( [[ "$GEN_SFT_EVERY_ROUND" == "1" ]] && echo "--gen-sft-every-round" || echo "--no-gen-sft" ) \
   --gen-sft-lr "$GEN_SFT_LR" \
   --gen-sft-steps "$GEN_SFT_STEPS" \
@@ -147,8 +161,10 @@ python -u scripts/gan_training.py \
   --output-dir "$OUTPUT_DIR" \
   --max-length "${MAX_LENGTH}" \
   --label-smoothing "$LABEL_SMOOTHING" \
+  --seed "$SEED" \
   --min-fool-rate-to-train "$MIN_FOOL_RATE" \
   --max-skip-rounds "$MAX_SKIP_ROUNDS" \
+  $( [[ -n "$DISC_POSITIVE_LABEL_ID" ]] && echo "--disc-positive-label-id $DISC_POSITIVE_LABEL_ID" ) \
   $( [[ "$USE_VAF_FEEDBACK" == "1" ]] && echo "--use-vaf-feedback" || echo "--no-vaf-feedback" ) \
   $( [[ "$USE_VAF_FEWSHOT" == "1" ]] && echo "--use-vaf-fewshot" || echo "--no-vaf-fewshot" )
 

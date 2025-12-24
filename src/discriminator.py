@@ -1,4 +1,5 @@
 import os
+import string
 from functools import lru_cache
 from typing import Optional
 
@@ -21,6 +22,58 @@ DEFAULT_ENCODER_MODEL = os.environ.get(
 )
 MAX_ENCODER_SEQ_LEN = int(os.environ.get("ENCODER_DISCRIMINATOR_MAX_LEN", "512"))
 
+STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "but",
+    "if",
+    "then",
+    "else",
+    "when",
+    "while",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "from",
+    "with",
+    "by",
+    "as",
+    "at",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "he",
+    "she",
+    "they",
+    "them",
+    "his",
+    "her",
+    "their",
+    "we",
+    "you",
+    "i",
+    "me",
+    "my",
+    "your",
+    "our",
+    "us",
+}
+
 
 class EncoderDiscriminator:
     """
@@ -33,20 +86,45 @@ class EncoderDiscriminator:
         self,
         model_name: str = DEFAULT_ENCODER_MODEL,
         max_length: int = MAX_ENCODER_SEQ_LEN,
+        positive_label_id: Optional[int] = None,
+        torch_dtype: Optional[torch.dtype] = None,
     ):
         self.model_name = model_name
         self.max_length = max_length
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             trust_remote_code=True,
             use_safetensors=True,  # avoid torch.load vulnerability path on older torch
+            torch_dtype=torch_dtype,
         ).to(self.device)
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         self.model.eval()
-        self.positive_label_id = self._detect_positive_label_id()
+        if positive_label_id is None:
+            env_override = os.environ.get("ENCODER_POSITIVE_LABEL_ID")
+            if env_override is not None and env_override.strip() != "":
+                try:
+                    positive_label_id = int(env_override)
+                except ValueError:
+                    print(
+                        f"Warning: invalid ENCODER_POSITIVE_LABEL_ID={env_override!r}; falling back to auto-detect."
+                    )
+                    positive_label_id = None
+        if positive_label_id is not None:
+            id2label = {int(k): v for k, v in self.model.config.id2label.items()}
+            if int(positive_label_id) not in id2label:
+                raise ValueError(
+                    f"positive_label_id {positive_label_id} not in model id2label={id2label}"
+                )
+            self.positive_label_id = int(positive_label_id)
+        else:
+            self.positive_label_id = self._detect_positive_label_id()
 
     def _detect_positive_label_id(self) -> int:
         id2label = {int(k): v for k, v in self.model.config.id2label.items()}
@@ -57,6 +135,11 @@ class EncoderDiscriminator:
                 for key in ("true", "real", "entail", "support", "pos", "positive")
             ):
                 return int(idx)
+        if all(label.lower().startswith("label_") for label in id2label.values()):
+            print(
+                "Warning: id2label is generic (LABEL_0/LABEL_1). "
+                "Defaulting positive_label_id to 1; set ENCODER_POSITIVE_LABEL_ID to override."
+            )
         return 1 if 1 in id2label else 0
 
     @torch.no_grad()
@@ -72,16 +155,58 @@ class EncoderDiscriminator:
         probs = torch.softmax(logits, dim=-1)
         return probs[0, self.positive_label_id].item()
 
+    def _is_noise_token(self, token: str) -> bool:
+        cleaned = token.strip()
+        if not cleaned:
+            return True
+        lower = cleaned.lower()
+        if lower in STOPWORDS:
+            return True
+        if len(lower) == 1 and lower.isalpha():
+            return True
+        if all(ch in string.punctuation for ch in cleaned):
+            return True
+        if not any(ch.isalnum() for ch in cleaned):
+            return True
+        return False
+
+    def _find_description_span(self, text: str) -> Optional[tuple[int, int]]:
+        marker = "Predict the plausibility of the following news story:\n\n"
+        start = text.find(marker)
+        if start == -1:
+            return None
+        start += len(marker)
+        end = text.find("\n\n", start)
+        if end == -1:
+            end = len(text)
+        if start >= end:
+            return None
+        return (start, end)
+
+    def _build_description_mask(
+        self, text: str, offsets: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        span = self._find_description_span(text)
+        if span is None:
+            return None
+        start, end = span
+        token_starts = offsets[:, 0]
+        token_ends = offsets[:, 1]
+        return (token_ends > start) & (token_starts < end)
+
     # 新增這個函式，用來抓出權重最高的字 (Generator 需要)
     @torch.no_grad()
     def get_suspicious_words(self, text: str, top_k: int = 5) -> str:
-        inputs = self.tokenizer(
+        enc = self.tokenizer(
             text,
             truncation=True,
             padding=True,
             max_length=self.max_length,
+            return_offsets_mapping=True,
             return_tensors="pt",
-        ).to(self.device)
+        )
+        offsets = enc.pop("offset_mapping", None)
+        inputs = enc.to(self.device)
 
         outputs = self.model(
             **inputs, output_attentions=True, return_dict=True
@@ -95,26 +220,45 @@ class EncoderDiscriminator:
         cls_att = avg_att[0, :]
 
         # 4. 處理 Token (過濾特殊符號)
-        input_ids = inputs["input_ids"][0].cpu().numpy()
-        special_mask = [
-            x
-            in [
-                self.tokenizer.cls_token_id,
-                self.tokenizer.sep_token_id,
-                self.tokenizer.pad_token_id,
-            ]
-            for x in input_ids
-        ]
-        # 將特殊 token 分數歸零，避免選中
-        cls_att[special_mask] = 0
+        input_ids = inputs["input_ids"][0].detach().cpu().tolist()
+        special_mask = torch.tensor(
+            [
+                x
+                in [
+                    self.tokenizer.cls_token_id,
+                    self.tokenizer.sep_token_id,
+                    self.tokenizer.pad_token_id,
+                ]
+                for x in input_ids
+            ],
+            dtype=torch.bool,
+            device=cls_att.device,
+        )
+        # 將特殊 token 與雜訊 token 分數歸零，避免選中
+        noise_mask = []
+        for tok_id in input_ids:
+            word = self.tokenizer.decode([tok_id])
+            noise_mask.append(self._is_noise_token(word))
+        noise_mask = torch.tensor(
+            noise_mask, dtype=torch.bool, device=cls_att.device
+        )
+        combined_mask = special_mask | noise_mask
+        if offsets is not None:
+            desc_mask = self._build_description_mask(text, offsets[0])
+            if desc_mask is not None:
+                combined_mask = combined_mask | (~desc_mask.to(cls_att.device))
+        cls_att = cls_att.masked_fill(combined_mask, 0)
 
         # 5. 找出分數最高的 Top-K
         values, indices = torch.topk(cls_att, k=min(top_k, len(cls_att)))
 
         suspicious_list = []
-        for idx, val in zip(indices, values):
+        for idx, val in zip(indices.tolist(), values.tolist()):
             # 解碼回文字
-            word = self.tokenizer.decode([input_ids[idx]])
+            tok_id = int(input_ids[int(idx)])
+            word = self.tokenizer.decode([tok_id]).strip()
+            if self._is_noise_token(word):
+                continue
             suspicious_list.append(f"{word}({val:.2f})")
 
         return ", ".join(suspicious_list)
@@ -143,13 +287,16 @@ class EncoderDiscriminator:
                 "improvement_suggestions": list,  # 改進建議
             }
         """
-        inputs = self.tokenizer(
+        enc = self.tokenizer(
             text,
             truncation=True,
             padding=True,
             max_length=self.max_length,
+            return_offsets_mapping=True,
             return_tensors="pt",
-        ).to(self.device)
+        )
+        offsets = enc.pop("offset_mapping", None)
+        inputs = enc.to(self.device)
 
         outputs = self.model(
             **inputs, output_attentions=True, return_dict=True
@@ -173,24 +320,40 @@ class EncoderDiscriminator:
         avg_att = torch.mean(attentions, dim=1).squeeze(0) # (seq, seq)
         cls_att = avg_att[0, :]                            # CLS 對其他 token 的注意力
 
-        input_ids = inputs["input_ids"][0].cpu().numpy()
-        special_mask = [
-            x in (
-                self.tokenizer.cls_token_id,
-                self.tokenizer.sep_token_id,
-                self.tokenizer.pad_token_id,
-            )
-            for x in input_ids
-        ]
-        cls_att[special_mask] = 0
+        input_ids = inputs["input_ids"][0].detach().cpu().tolist()
+        special_mask = torch.tensor(
+            [
+                x in (
+                    self.tokenizer.cls_token_id,
+                    self.tokenizer.sep_token_id,
+                    self.tokenizer.pad_token_id,
+                )
+                for x in input_ids
+            ],
+            dtype=torch.bool,
+            device=cls_att.device,
+        )
+        noise_mask = []
+        for tok_id in input_ids:
+            word = self.tokenizer.decode([tok_id])
+            noise_mask.append(self._is_noise_token(word))
+        noise_mask = torch.tensor(
+            noise_mask, dtype=torch.bool, device=cls_att.device
+        )
+        combined_mask = special_mask | noise_mask
+        if offsets is not None:
+            desc_mask = self._build_description_mask(text, offsets[0])
+            if desc_mask is not None:
+                combined_mask = combined_mask | (~desc_mask.to(cls_att.device))
+        cls_att = cls_att.masked_fill(combined_mask, 0)
 
         values, indices = torch.topk(cls_att, k=min(top_k, len(cls_att)))
 
         suspicious_words = []
-        for idx, val in zip(indices, values):
+        for idx, val in zip(indices.tolist(), values.tolist()):
             word = self.tokenizer.decode([int(input_ids[int(idx)])]).strip()
-            if word:
-                suspicious_words.append((word, float(val.item())))
+            if word and not self._is_noise_token(word):
+                suspicious_words.append((word, float(val)))
 
         top_suspicious = suspicious_words[0][0] if suspicious_words else ""
 
@@ -293,8 +456,16 @@ class EncoderDiscriminator:
 @lru_cache(maxsize=1)
 def get_encoder_discriminator(
     model_name: str = DEFAULT_ENCODER_MODEL,
+    positive_label_id: Optional[int] = None,
 ) -> EncoderDiscriminator:
-    return EncoderDiscriminator(model_name=model_name)
+    return EncoderDiscriminator(
+        model_name=model_name, positive_label_id=positive_label_id
+    )
+
+
+def reset_encoder_discriminator() -> None:
+    """Clear cached discriminator instance (useful after env changes)."""
+    get_encoder_discriminator.cache_clear()
 
 
 def get_retrieval_ctx(
@@ -320,7 +491,7 @@ def get_retrieval_ctx(
         )
         query = str(query_src)[:160].strip()
         if not query:
-            return text
+            return ""
 
         dpr = get_dpr()
         scores, retrieved_examples = dpr.search(query, k=num_results)

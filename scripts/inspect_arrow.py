@@ -24,14 +24,14 @@ def main():
     parser.add_argument(
         "path",
         nargs="?",
-        default="local/rag_gan_runs/gen_on_dis_on/round_1/data-00000-of-00001.arrow",
+        default="local/rag_gan_runs/gen_on_dis_on/round_6/data-00000-of-00001.arrow",
         help="Path to the dataset directory or to a data-*.arrow file.",
     )
     parser.add_argument(
         "-n",
         "--num-records",
         type=int,
-        default=5,
+        default=10,
         help="How many rows to show (default: 10).",
     )
     args = parser.parse_args()

@@ -42,7 +42,8 @@ MODEL_ID = LOCAL_MODEL_ID
 
 FACT_CHANGE_INSTRUCTION = (
     "CRITICAL: You MUST introduce 1–2 factual changes that meaningfully alter the story while keeping the SAME main event. "
-    "The article must still be about the same central event as the original (for example, the same speech, trial, accident, or policy decision). "
+    "The article must remain about the exact same central event as the original (e.g., the same speech, trial, accident, or policy decision). "
+    "Do NOT switch to a different event, topic, organization, or country; keep the same core incident and storyline. "
     "In the VERY FIRST sentence of the rewritten article, you MUST change at least one core fact: WHO, WHERE, WHEN, a KEY NUMBER, or the OUTCOME. "
     "You must NOT copy the first sentence verbatim; its wording and at least one core fact must be different from the original. "
     "You may change who was involved, where it happened, when it happened, important numbers (amounts, years, percentages), or the cause/outcome of events. "
@@ -174,18 +175,6 @@ YOUR ADAPTATION STRATEGY:
 """
 
         user_prompt = f"""
-Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
-{context}
-
-How to use the reference:
-- Use the retrieved articles as a realism boundary, not as facts to copy.
-- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
-- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
-- Do NOT copy specific facts, names, or sentences from the reference.
-- Do NOT introduce a new unrelated event.
-- If the reference conflicts with the original story, keep your story internally consistent.
-- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
-
 Original Real News:
 {content}{feedback_section}
 
@@ -202,6 +191,18 @@ REQUIRED FACTUAL EDITS:
 * the cause or the outcome of the events.
 - The modified story must remain coherent and plausible.
 - You MUST NOT merely paraphrase sentences or replace words with synonyms while keeping all facts the same.
+
+Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
+{context}
+
+How to use the reference:
+- Use the retrieved articles as a realism boundary, not as facts to copy.
+- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
+- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
+- Do NOT copy specific facts, names, or sentences from the reference.
+- Do NOT introduce a new unrelated event.
+- If the reference conflicts with the original story, keep your story internally consistent.
+- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
 
 CRITICAL FORMATTING RULES:
 1. Do NOT use any Markdown formatting (no ###, no **, no bullet points).
@@ -369,19 +370,6 @@ YOUR ADAPTATION STRATEGY:
 """
 
         user_prompt = f"""
-Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
-{context}
-
-
-How to use the reference:
-- Use the retrieved articles as a realism boundary, not as facts to copy.
-- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
-- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
-- Do NOT copy specific facts, names, or sentences from the reference.
-- Do NOT introduce a new unrelated event.
-- If the reference conflicts with the original story, keep your story internally consistent.
-- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
-
 Original Real News:
 {content}{feedback_section}
 
@@ -398,6 +386,19 @@ REQUIRED FACTUAL EDITS:
 * the cause or the outcome of the events.
 - The modified story must remain coherent and plausible.
 - You MUST NOT merely paraphrase sentences or replace words with synonyms while keeping all facts the same.
+
+Retrieved Writing Reference (for realism boundary; do NOT copy specific facts):
+{context}
+
+
+How to use the reference:
+- Use the retrieved articles as a realism boundary, not as facts to copy.
+- Observe what kinds of details are typically reported for similar events (who speaks, where announcements happen, what numbers look reasonable).
+- When changing facts, keep them within ranges and patterns commonly seen in real news reporting.
+- Do NOT copy specific facts, names, or sentences from the reference.
+- Do NOT introduce a new unrelated event.
+- If the reference conflicts with the original story, keep your story internally consistent.
+- Do NOT make factual changes that would look unusual or implausible compared to how similar real news events are typically reported.
 
 CRITICAL FORMATTING RULES:
 1. Do NOT use any Markdown formatting (no ###, no **, no bullet points).
@@ -523,14 +524,19 @@ class FakeNewsGenerator:
         """生成假新聞"""
         real_news = {"text": content}
 
-        # RAG 處理：優先使用 context_override；否則用 DPR 取 top-k 內文 context
-        rag_context = context_override if context_override is not None else ""
-        if use_rag and context_override is None:
-            rag_context = build_rag_context(
-                rag_query=rag_query,
-                content=content,
-                num_results=num_rag_results,
-            )
+        # RAG 處理：只有非空 override 才覆蓋，否則用 DPR 取 top-k 內文 context
+        override = (context_override or "").strip()
+        if use_rag:
+            if override:
+                rag_context = override
+            else:
+                rag_context = build_rag_context(
+                    rag_query=rag_query,
+                    content=content,
+                    num_results=num_rag_results,
+                )
+        else:
+            rag_context = ""
 
         fake_news = self.engine.generate_fake_news(
             real_news, rag_context, feedback_prompt, train_mode=train_mode

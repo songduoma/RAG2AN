@@ -8,6 +8,7 @@ Macro-F1 and ROC-AUC.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -20,7 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.discriminator import EncoderDiscriminator, MAX_ENCODER_SEQ_LEN
+from src.discriminator import (
+    EncoderDiscriminator,
+    MAX_ENCODER_SEQ_LEN,
+    format_discriminator_input,
+)
 
 
 def _clean_text(val) -> str:
@@ -31,7 +36,12 @@ def _clean_text(val) -> str:
     return str(val).strip()
 
 
-def load_advfake_pairs(dataset_path: Path) -> Tuple[List[str], List[int]]:
+def load_advfake_pairs(
+    dataset_path: Path,
+    disc_use_rag: bool,
+    rag_source: str,
+    num_rag_results: int,
+) -> Tuple[List[str], List[int]]:
     """
     Returns texts + labels where 1 = real description, 0 = fake rewrite.
     """
@@ -44,10 +54,27 @@ def load_advfake_pairs(dataset_path: Path) -> Tuple[List[str], List[int]]:
         fake = _clean_text(row.get("f_description", ""))
 
         if real:
-            texts.append(real)
+            texts.append(
+                format_discriminator_input(
+                    row,
+                    rag=disc_use_rag,
+                    prefix="",
+                    source=rag_source,
+                    num_results=num_rag_results,
+                )
+            )
             labels.append(1)
         if fake:
-            texts.append(fake)
+            texts.append(
+                format_discriminator_input(
+                    row,
+                    rag=disc_use_rag,
+                    prefix="",
+                    description_override=fake,
+                    source=rag_source,
+                    num_results=num_rag_results,
+                )
+            )
             labels.append(0)
 
     return texts, labels
@@ -79,6 +106,10 @@ def predict_probs(
 
 
 def parse_args() -> argparse.Namespace:
+    env_disc_use_rag = os.environ.get("DISC_USE_RAG", "0")
+    default_disc_use_rag = str(env_disc_use_rag).strip() == "1"
+    default_rag_source = os.environ.get("RAG_SOURCE", "dpr")
+    default_num_rag_results = int(os.environ.get("NUM_RAG_RESULTS", "3"))
     parser = argparse.ArgumentParser(
         description="Evaluate discriminator checkpoint(s) on advfake."
     )
@@ -91,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models-dir",
         type=Path,
-        default=Path("local/rag_gan_runs/20251216_234851"),
+        default=Path("local/rag_gan_runs/20251223_132301"),
         help="Directory containing per-round discriminator folders (disc_round_*).",
     )
     parser.add_argument(
@@ -105,6 +136,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Batch size for inference.",
+    )
+    parser.add_argument(
+        "--disc-use-rag",
+        action="store_true",
+        default=default_disc_use_rag,
+        help="Match training distribution by including RAG context.",
+    )
+    parser.add_argument(
+        "--no-disc-rag",
+        action="store_false",
+        dest="disc_use_rag",
+        help="Disable RAG context (still applies discriminator prompt prefix).",
+    )
+    parser.add_argument(
+        "--rag-source",
+        type=str,
+        default=default_rag_source,
+        choices=["dpr", "none"],
+        help="Retrieval source used for building the context.",
+    )
+    parser.add_argument(
+        "--num-rag-results",
+        type=int,
+        default=default_num_rag_results,
+        help="Number of retrieved documents to include.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        default=True,
+        help="Load the discriminator with bfloat16 weights.",
     )
     parser.add_argument(
         "--max-length",
@@ -122,7 +184,12 @@ def main() -> None:
         raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
 
     print(f"Loading advfake pairs from {args.dataset_path} ...")
-    texts, labels = load_advfake_pairs(args.dataset_path)
+    texts, labels = load_advfake_pairs(
+        args.dataset_path,
+        disc_use_rag=args.disc_use_rag,
+        rag_source=args.rag_source,
+        num_rag_results=args.num_rag_results,
+    )
     n_real = sum(labels)
     n_fake = len(labels) - n_real
     print(f"Loaded {len(labels)} samples (real={n_real}, fake={n_fake}).")
@@ -145,11 +212,13 @@ def main() -> None:
             )
 
     results = []
+    torch_dtype = torch.bfloat16 if args.bf16 else None
     for name, path in model_paths.items():
         print(f"\nEvaluating {name} @ {path}")
         disc = EncoderDiscriminator(
             model_name=path,
             max_length=args.max_length,
+            torch_dtype=torch_dtype,
         )
 
         probs_true = predict_probs(disc, texts, batch_size=args.batch_size)

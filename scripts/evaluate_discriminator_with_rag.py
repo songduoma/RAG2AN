@@ -7,6 +7,7 @@ same DPR context used during GAN training.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -152,13 +153,15 @@ def predict_probs(
 
 
 def parse_args() -> argparse.Namespace:
+    default_rag_source = os.environ.get("RAG_SOURCE", "dpr")
+    default_num_rag_results = int(os.environ.get("NUM_RAG_RESULTS", "3"))
     parser = argparse.ArgumentParser(
         description="Evaluate discriminators using RAG-enabled inputs on advfake."
     )
     parser.add_argument(
         "--models-dir",
         type=Path,
-        default=Path("local/rag_gan_runs/G+D+_neither"),
+        default=Path("local/rag_gan_runs/G-D+"),
         help="Directory containing disc_round_* checkpoints.",
     )
     parser.add_argument(
@@ -170,14 +173,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rag-source",
         type=str,
-        default="dpr",
+        default=default_rag_source,
         choices=["dpr", "none"],
         help="Retrieval source used for building the context.",
     )
     parser.add_argument(
         "--num-rag-results",
         type=int,
-        default=3,
+        default=default_num_rag_results,
         help="Number of retrieved documents to include.",
     )
     parser.add_argument(
@@ -194,6 +197,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Batch size for inference (use smaller size if GPU memory limited).",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        default=True,
+        help="Force loading the discriminator with bfloat16 weights.",
     )
     parser.add_argument(
         "--max-length",
@@ -238,9 +247,14 @@ def main() -> None:
         raise FileNotFoundError(f"No disc_round_* folders found under {base}")
 
     results = []
+    torch_dtype = torch.bfloat16
     for name, path in model_paths.items():
         print(f"\nEvaluating {name} with RAG @ {path}")
-        disc = EncoderDiscriminator(model_name=path, max_length=args.max_length)
+        disc = EncoderDiscriminator(
+            model_name=path,
+            max_length=args.max_length,
+            torch_dtype=torch_dtype,
+        )
 
         probs_true = predict_probs(disc, texts, batch_size=args.batch_size)
         preds = [1 if p >= 0.5 else 0 for p in probs_true]
